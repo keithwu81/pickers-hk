@@ -1,0 +1,17 @@
+# Build artifacts
+node_modules/
+dist/
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test files
+_test.js
+_e2e.html

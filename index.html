@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ClassView 答題卡 — 匡智張玉瓊晨輝學校</title>
+  <link rel="stylesheet" href="styles.css">
+  <!-- CDN Libraries -->
+  <script src="https://cdn.jsdelivr.net/gh/davidshimjs/qrcodejs/qrcode.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/jspdf@2.5.1/dist/jspdf.umd.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+</head>
+<body>
+  <!-- 學校名 Banner -->
+  <div class="school-banner">匡智張玉瓊晨輝學校</div>
+
+  <!-- 頂部導航 -->
+  <header class="app-header">
+    <div class="header-inner">
+      <h1 class="app-title">
+        <span class="logo">📚</span>
+        <span>ClassView 答題卡</span>
+      </h1>
+      <nav class="main-nav" id="mainNav">
+        <button class="nav-btn" data-view="home">🏠 首頁</button>
+        <button class="nav-btn" data-view="quizzes">📝 題目</button>
+        <button class="nav-btn" data-view="students">👨‍🎓 學生</button>
+        <button class="nav-btn" data-view="cards">🖨️ 紙卡</button>
+        <button class="nav-btn" data-view="live">▶️ 答題</button>
+        <button class="nav-btn" data-view="results">📊 結果</button>
+      </nav>
+    </div>
+  </header>
+
+  <!-- 主內容區 -->
+  <main id="app" class="app-main">
+    <!-- View 會被 JS 動態載入 -->
+  </main>
+
+  <!-- Toast 通知 -->
+  <div id="toast" class="toast"></div>
+
+  <!-- Modal 容器 -->
+  <div id="modalRoot"></div>
+
+  <!-- 固定鏡頭 widget（不受 view 切換影響） -->
+  <div id="camera-widget" class="camera-widget" style="display: none;">
+    <div class="camera-widget-header">
+      <span class="camera-widget-title">📷 鏡頭補掃</span>
+      <button class="camera-widget-close" onclick="stopScanner()">✕</button>
+    </div>
+    <video id="scannerVideo" playsinline autoplay muted></video>
+    <div class="camera-widget-status" id="scannerStatus">鏡頭未啟動</div>
+    <div class="camera-widget-detected" id="scannerDetected" style="display:none;"></div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
