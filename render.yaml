@@ -1,6 +1,7 @@
 services:
-  - type: static
+  - type: web
     name: classview-plickers
+    runtime: static
     buildCommand: ""
     staticPublishPath: .
     headers:
