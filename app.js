@@ -331,7 +331,7 @@ views.login = () => {
           <label class="form-label">密碼</label>
           <input type="password" id="loginPassword" class="form-input" placeholder="至少 4 個字">
         </div>
-        <div class="form-group" id="registerDisplayNameGroup" style="display: none;">
+        <div class="form-group" id="registerDisplayNameGroup" style="display: ${isFirstUser ? '' : 'none'};">
           <label class="form-label">顯示名稱</label>
           <input type="text" id="registerDisplayName" class="form-input" placeholder="例：陳老師、Mr. Chan">
         </div>
@@ -351,7 +351,9 @@ window.doLogin = async function() {
   const password = document.getElementById('loginPassword')?.value;
   const displayName = document.getElementById('registerDisplayName')?.value;
   const errEl = document.getElementById('loginError');
-  const isRegister = document.getElementById('registerDisplayNameGroup')?.style.display !== 'none';
+  // 第一個 user 必定係 register mode（無論 UI 狀態）
+  let isRegister = document.getElementById('registerDisplayNameGroup')?.style.display !== 'none';
+  if (state.users.length === 0) isRegister = true;
   if (errEl) errEl.textContent = '';
   const result = isRegister
     ? await registerUser(username, password, displayName)
