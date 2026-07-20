@@ -2612,7 +2612,28 @@ function init() {
   window.visibleSessions = visibleSessions;
 }
 
-init();
+// 包 init() 喺 try-catch 入面，如果有 error 直接顯示喺 page
+try {
+  init();
+} catch (e) {
+  console.error('Init failed:', e);
+  const main = document.getElementById('app');
+  if (main) {
+    main.innerHTML = `
+      <div style="max-width: 800px; margin: 40px auto; padding: 24px; background: #fee; border: 2px solid #dc2626; border-radius: 8px; color: #7f1d1d;">
+        <h2 style="color: #dc2626;">⚠️ 啟動錯誤</h2>
+        <p><b>訊息：</b> ${escapeHtml(e.message || String(e))}</p>
+        <pre style="background: #fff; padding: 12px; border-radius: 4px; overflow: auto; font-size: 12px; max-height: 300px;">${escapeHtml(e.stack || '')}</pre>
+        <p style="margin-top: 16px;"><b>建議：</b></p>
+        <ol style="padding-left: 24px; line-height: 1.8;">
+          <li>打開 DevTools (F12) → Console 睇完整錯誤</li>
+          <li>試用 <b>無痕模式 (Ctrl+Shift+N)</b> 開新 tab</li>
+          <li>清 localStorage：DevTools → Application → Local Storage → Clear</li>
+        </ol>
+      </div>
+    `;
+  }
+}
 
 /* ================================================
    13. PDF 匯出（紙卡）- 1 張卡 = 1 頁 A4
