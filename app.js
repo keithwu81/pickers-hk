@@ -436,6 +436,17 @@ function showUserMenu() {
         <button class="btn btn-warning btn-sm" onclick="closeModal(); importAllData();">📥 還原備份</button>
       </div>
     </div>
+    <div class="form-group mt-2" style="border-top: 1px solid #e5e7eb; padding-top: 12px;">
+      <div class="text-muted text-sm">☁️ 雲端同步（Supabase）</div>
+      <div class="form-hint mb-2">
+        ${isCloudConfigured() ? '✓ 已設定：' + escapeHtml(getCloudConfig().url) : '⚠️ 未設定'}
+      </div>
+      <div class="row" style="gap: 6px; flex-wrap: wrap;">
+        <button class="btn btn-ghost btn-sm" onclick="closeModal(); pushToCloud();">⬆️ 上傳到雲端</button>
+        <button class="btn btn-primary btn-sm" onclick="closeModal(); pullFromCloud();">⬇️ 從雲端還原</button>
+        <button class="btn btn-ghost btn-sm" onclick="closeModal(); pushToCloud();">⚙️ 設定</button>
+      </div>
+    </div>
   `);
 }
 
@@ -490,6 +501,157 @@ function exportAllData() {
 function visibleQuizzesCountForExport() {
   return myQuizzes().length;
 }
+
+/* ================================================
+   1e. Supabase 雲端同步 (optional)
+   - User 喺 Settings 輸入 Supabase URL + anon key
+   - 一個 user 一個 row (primary key = user_id)
+   - 每次 push 覆蓋自己個 row
+   ================================================ */
+
+const CLOUD_CONFIG_KEY = 'classview_cloud_config_v1';
+const CLOUD_TABLE = 'classview_user_data'; // 預設
+
+function getCloudConfig() {
+  try {
+    const raw = localStorage.getItem(CLOUD_CONFIG_KEY);
+    return raw ? JSON.parse(raw) : { url: '', anonKey: '', tableName: CLOUD_TABLE };
+  } catch (e) {
+    return { url: '', anonKey: '', tableName: CLOUD_TABLE };
+  }
+}
+
+function saveCloudConfig(cfg) {
+  localStorage.setItem(CLOUD_CONFIG_KEY, JSON.stringify(cfg));
+}
+
+function isCloudConfigured() {
+  const cfg = getCloudConfig();
+  return !!(cfg.url && cfg.anonKey);
+}
+
+function getSupabaseClient() {
+  if (!isCloudConfigured()) return null;
+  if (!window.supabase) return null;
+  const cfg = getCloudConfig();
+  return window.supabase.createClient(cfg.url, cfg.anonKey, {
+    auth: { persistSession: false },
+  });
+}
+
+async function pushToCloud() {
+  const u = currentUser();
+  if (!u) { toast('請先登入', 'error'); return; }
+  if (!isCloudConfigured()) {
+    openModal(`
+      <div class="modal-header">
+        <div class="modal-title">☁️ 設定雲端同步 (Supabase)</div>
+        <button class="modal-close" onclick="closeModal()">×</button>
+      </div>
+      <div class="form-group">
+        <div class="form-hint">需要先喺 Supabase 建立 project，拎 URL + anon key 填下面。</div>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Supabase Project URL</label>
+        <input type="text" id="cloudUrl" class="form-input" placeholder="https://xxxxx.supabase.co" value="${escapeAttr(getCloudConfig().url)}">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Supabase Anon Public Key</label>
+        <input type="password" id="cloudAnonKey" class="form-input" placeholder="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..." value="${escapeAttr(getCloudConfig().anonKey)}">
+        <div class="form-hint">anon key 係公開嘅（前端用），但用嚟過濾 RLS。見 SUPABASE_SETUP.md。</div>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Table 名稱</label>
+        <input type="text" id="cloudTable" class="form-input" value="${escapeAttr(getCloudConfig().tableName || CLOUD_TABLE)}">
+        <div class="form-hint">預設 <code>classview_user_data</code>。要喺 Supabase 創建（SQL 見 SUPABASE_SETUP.md）。</div>
+      </div>
+      <div class="row-end">
+        <button class="btn btn-ghost" onclick="closeModal()">取消</button>
+        <button class="btn btn-primary" onclick="saveCloudSettings()">💾 儲存設定</button>
+      </div>
+    `);
+    return;
+  }
+  const client = getSupabaseClient();
+  if (!client) {
+    toast('❌ Supabase client 載入失敗（檢查 CDN）', 'error');
+    return;
+  }
+  const cfg = getCloudConfig();
+  toast('上傳中…', 'success');
+  try {
+    const payload = {
+      user_id: u.id,
+      username: u.username,
+      data: {
+        users: state.users,
+        currentUserId: state.currentUserId,
+        folders: state.folders,
+        quizzes: state.quizzes,
+        classes: state.classes,
+        students: state.students,
+        sessions: state.sessions,
+      },
+      updated_at: new Date().toISOString(),
+    };
+    const { error } = await client.from(cfg.tableName).upsert(payload, { onConflict: 'user_id' });
+    if (error) throw error;
+    toast(`✓ 已上傳到雲端（${state.quizzes.length} 題 / ${state.students.length} 學生 / ${state.sessions.length} 答題）`, 'success');
+  } catch (e) {
+    console.error(e);
+    toast('❌ 上傳失敗：' + e.message, 'error');
+  }
+}
+
+async function pullFromCloud() {
+  const u = currentUser();
+  if (!u) { toast('請先登入', 'error'); return; }
+  if (!isCloudConfigured()) {
+    toast('❌ 雲端未設定，請先輸入 Supabase URL + Key', 'error');
+    return;
+  }
+  if (!confirm(`⚠️ 從雲端下載會覆蓋現有資料！\n\n建議先匯出本地備份。\n\n確定繼續？`)) return;
+  const client = getSupabaseClient();
+  if (!client) { toast('❌ Supabase client 載入失敗', 'error'); return; }
+  const cfg = getCloudConfig();
+  toast('下載中…', 'success');
+  try {
+    const { data, error } = await client.from(cfg.tableName).select('*').eq('user_id', u.id).maybeSingle();
+    if (error) throw error;
+    if (!data) {
+      toast('☁️ 雲端冇你嘅記錄（首次上傳前）', 'warning');
+      return;
+    }
+    // 確認 overwrite
+    if (!confirm(`📦 雲端記錄：\n用戶：${data.username}\n更新時間：${data.updated_at || '未知'}\n\n覆蓋本地資料？`)) return;
+    // Apply cloud data
+    const s = data.data || {};
+    ['users', 'folders', 'quizzes', 'classes', 'students', 'sessions'].forEach(k => {
+      state[k].splice(0, state[k].length);
+      (s[k] || []).forEach(x => state[k].push(x));
+    });
+    state.currentUserId = s.currentUserId || null;
+    saveSessionUserId(state.currentUserId);
+    saveState();
+    toast(`✓ 已從雲端還原（${(s.quizzes || []).length} 題 / ${(s.students || []).length} 學生）`, 'success');
+    renderUserButton();
+    setView('home');
+  } catch (e) {
+    console.error(e);
+    toast('❌ 下載失敗：' + e.message, 'error');
+  }
+}
+
+window.saveCloudSettings = function() {
+  const url = document.getElementById('cloudUrl')?.value?.trim();
+  const anonKey = document.getElementById('cloudAnonKey')?.value?.trim();
+  const tableName = document.getElementById('cloudTable')?.value?.trim() || CLOUD_TABLE;
+  if (!url) { toast('請輸入 Supabase URL', 'error'); return; }
+  if (!anonKey) { toast('請輸入 Supabase Anon Key', 'error'); return; }
+  saveCloudConfig({ url, anonKey, tableName });
+  toast('✓ 已儲存雲端設定', 'success');
+  closeModal();
+};
 
 function importAllData() {
   const input = document.createElement('input');
@@ -2737,6 +2899,10 @@ function init() {
   window.visibleSessions = visibleSessions;
   window.exportAllData = exportAllData;
   window.importAllData = importAllData;
+  window.pushToCloud = pushToCloud;
+  window.pullFromCloud = pullFromCloud;
+  window.getCloudConfig = getCloudConfig;
+  window.isCloudConfigured = isCloudConfigured;
 }
 
 // 包 init() 喺 try-catch 入面，如果有 error 直接顯示喺 page
