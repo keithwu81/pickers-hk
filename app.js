@@ -428,6 +428,14 @@ function showUserMenu() {
       <button class="btn btn-ghost" onclick="closeModal()">關閉</button>
       <button class="btn btn-danger" onclick="doLogout()">🚪 登出</button>
     </div>
+    <div class="form-group mt-2" style="border-top: 1px solid #e5e7eb; padding-top: 12px;">
+      <div class="text-muted text-sm">💾 備份 / 還原</div>
+      <div class="form-hint mb-2">純前端無 server-side database。export / import JSON 嚟跨 device / 環境同步。</div>
+      <div class="row" style="gap: 6px; flex-wrap: wrap;">
+        <button class="btn btn-ghost btn-sm" onclick="closeModal(); exportAllData();">💾 匯出備份</button>
+        <button class="btn btn-warning btn-sm" onclick="closeModal(); importAllData();">📥 還原備份</button>
+      </div>
+    </div>
   `);
 }
 
@@ -439,6 +447,117 @@ window.doLogout = function() {
   renderUserButton();
   setView('login');
 };
+
+/* ================================================
+   1d. 備份 / 還原 (Export / Import JSON)
+   純前端無 server-side database，所以用 export/import
+   喺唔同 device / 開發環境同步資料
+   ================================================ */
+
+function exportAllData() {
+  try {
+    const data = {
+      _version: 1,
+      _exportedAt: new Date().toISOString(),
+      _exportedBy: currentUser()?.username || 'unknown',
+      state: {
+        users: state.users,
+        currentUserId: state.currentUserId,
+        folders: state.folders,
+        quizzes: state.quizzes,
+        classes: state.classes,
+        students: state.students,
+        sessions: state.sessions,
+      },
+    };
+    const json = JSON.stringify(data, null, 2);
+    const blob = new Blob([json], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    a.href = url;
+    a.download = `ClassView-備份-${ts}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+    toast(`✓ 已匯出備份（${state.users.length} user / ${visibleQuizzesCountForExport()} 份題目 / ${state.students.length} 位學生）`, 'success');
+  } catch (e) {
+    console.error(e);
+    toast('❌ 匯出失敗：' + e.message, 'error');
+  }
+}
+
+// Export helper (唔 recursive 過 visibleXxx() 避免 stack overflow)
+function visibleQuizzesCountForExport() {
+  return myQuizzes().length;
+}
+
+function importAllData() {
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.accept = '.json,application/json';
+  input.onchange = async (ev) => {
+    const file = ev.target.files[0];
+    if (!file) return;
+    if (!confirm(`⚠️ 確定要還原 ${file.name}？\n\n現有資料會被覆蓋！建議先匯出備份。`)) {
+      return;
+    }
+    try {
+      const text = await file.text();
+      const data = JSON.parse(text);
+      if (!data.state || !data._version) {
+        throw new Error('檔案格式錯誤（缺少 _version 或 state）');
+      }
+      // 確認 format
+      const counts = {
+        users: (data.state.users || []).length,
+        quizzes: (data.state.quizzes || []).length,
+        students: (data.state.students || []).length,
+        sessions: (data.state.sessions || []).length,
+        classes: (data.state.classes || []).length,
+      };
+      if (!confirm(`📦 偵測到備份：\n${counts.users} 用戶 · ${counts.quizzes} 題目 · ${counts.students} 學生 · ${counts.sessions} 答題 · ${counts.classes} 班級\n\n備份時間：${data._exportedAt || '未知'}\n備份者：${data._exportedBy || '未知'}\n\n確定還原？`)) {
+        return;
+      }
+      // 還原 state（用 Object.assign 保持 reactive proxy）
+      const s = data.state;
+      // 清空現有
+      state.users.splice(0, state.users.length);
+      state.folders.splice(0, state.folders.length);
+      state.quizzes.splice(0, state.quizzes.length);
+      state.classes.splice(0, state.classes.length);
+      state.students.splice(0, state.students.length);
+      state.sessions.splice(0, state.sessions.length);
+      // 載入新
+      (s.users || []).forEach(x => state.users.push(x));
+      (s.folders || []).forEach(x => state.folders.push(x));
+      (s.quizzes || []).forEach(x => state.quizzes.push(x));
+      (s.classes || []).forEach(x => state.classes.push(x));
+      (s.students || []).forEach(x => state.students.push(x));
+      (s.sessions || []).forEach(x => state.sessions.push(x));
+      state.currentUserId = s.currentUserId || null;
+      // 同步 session storage
+      saveSessionUserId(state.currentUserId);
+      saveState();
+      // 重新登入驗證
+      if (state.currentUserId && !state.users.find(u => u.id === state.currentUserId)) {
+        state.currentUserId = null;
+        saveSessionUserId(null);
+        saveState();
+        toast('⚠️ 還原完成，但當前登入用戶唔喺新資料中，已登出', 'warning');
+        renderUserButton();
+        setView('login');
+      } else {
+        toast(`✓ 已還原 ${counts.users} 用戶 / ${counts.quizzes} 題目 / ${counts.students} 學生 / ${counts.sessions} 答題 / ${counts.classes} 班級`, 'success');
+        renderUserButton();
+        setView('home');
+      }
+    } catch (e) {
+      console.error(e);
+      toast('❌ 還原失敗：' + e.message, 'error');
+    }
+  };
+  input.click();
+}
 
 /* ---------- Home ---------- */
 views.home = () => `
@@ -2616,6 +2735,8 @@ function init() {
   window.visibleStudents = visibleStudents;
   window.visibleClasses = visibleClasses;
   window.visibleSessions = visibleSessions;
+  window.exportAllData = exportAllData;
+  window.importAllData = importAllData;
 }
 
 // 包 init() 喺 try-catch 入面，如果有 error 直接顯示喺 page
