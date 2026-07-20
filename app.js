@@ -189,12 +189,15 @@ function logoutUser() {
 
 /* ================================================
    1c. 過濾 helpers (per-user visibility)
+   ⚠️ 唔好用 myQuizzes() / visibleXxx() self-call
+   （之前 surgical replace 將內部 state.X.filter 改成 self-call，造成無窮遞迴）
    ================================================ */
 function myQuizzes() {
   const u = currentUser();
   if (!u) return [];
-  if (u.isAdmin) return state.quizzes;
-  return myQuizzes().filter(q => q.ownerId === u.id);
+  const all = state.quizzes;
+  if (u.isAdmin) return all;
+  return all.filter(q => q.ownerId === u.id);
 }
 
 function myFolders() {
@@ -206,9 +209,10 @@ function myFolders() {
 function visibleStudents() {
   const u = currentUser();
   if (!u) return [];
-  if (u.isAdmin) return state.students;
+  const all = state.students;
   const adminIds = state.users.filter(x => x.isAdmin).map(x => x.id);
-  return visibleStudents().filter(s =>
+  if (u.isAdmin) return all;
+  return all.filter(s =>
     s.ownerId === u.id || (s.ownerId && adminIds.includes(s.ownerId))
   );
 }
@@ -216,9 +220,10 @@ function visibleStudents() {
 function visibleClasses() {
   const u = currentUser();
   if (!u) return [];
-  if (u.isAdmin) return state.classes;
+  const all = state.classes;
   const adminIds = state.users.filter(x => x.isAdmin).map(x => x.id);
-  return visibleClasses().filter(c =>
+  if (u.isAdmin) return all;
+  return all.filter(c =>
     c.ownerId === u.id || (c.ownerId && adminIds.includes(c.ownerId))
   );
 }
