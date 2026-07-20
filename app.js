@@ -231,8 +231,9 @@ function visibleClasses() {
 function visibleSessions() {
   const u = currentUser();
   if (!u) return [];
-  if (u.isAdmin) return state.sessions;
-  return visibleSessions().filter(s => s.ownerId === u.id);
+  const all = state.sessions;
+  if (u.isAdmin) return all;
+  return all.filter(s => s.ownerId === u.id);
 }
 
 /* ================================================
