@@ -9,16 +9,31 @@
    1. 狀態管理
    ================================================ */
 const STORAGE_KEY = 'classview_plickers_v1';
+const SESSION_KEY = 'classview_pickers_session_v1'; // 當前登入 user id
 
 const defaultState = {
-  quizzes: [],
-  classes: [],   // 班級（{id, name, createdAt}）
-  students: [],  // 學生（{id, classId, number, name}）
-  sessions: [],
+  users: [],            // [{ id, username, passwordHash, displayName, isAdmin, createdAt }]
+  currentUserId: null,  // 進行中登入嘅 user id
+  folders: [],          // [{ id, ownerId, name, color, createdAt }]
+  quizzes: [],          // [{ id, ownerId, folderId, title, questions, ... }]
+  classes: [],          // [{ id, ownerId, name, createdAt }]
+  students: [],         // [{ id, ownerId, classId, number, name, ... }]
+  sessions: [],         // [{ id, ownerId, quizId, classId, answers, ... }]
   currentSession: null, // 進行中的 session 暫存
 };
 
 let state = loadState();
+
+// 從獨立嘅 session key 讀取登入狀態
+function loadSessionUserId() {
+  try { return localStorage.getItem(SESSION_KEY); } catch (e) { return null; }
+}
+function saveSessionUserId(uid) {
+  try {
+    if (uid) localStorage.setItem(SESSION_KEY, uid);
+    else localStorage.removeItem(SESSION_KEY);
+  } catch (e) {}
+}
 
 function loadState() {
   try {
@@ -26,37 +41,51 @@ function loadState() {
     if (!raw) return { ...defaultState };
     const parsed = JSON.parse(raw);
     const merged = { ...defaultState, ...parsed };
-    // Migration: 確保 classes 一定存在
+    if (!merged.users) merged.users = [];
+    if (!merged.folders) merged.folders = [];
     if (!merged.classes) merged.classes = [];
-    // Migration: 確保每個 student 有 classId
-    if (merged.students) {
-      merged.students.forEach(s => {
-        if (typeof s.classId === 'undefined') s.classId = null;
-      });
-    }
-    // 向後相容：舊資料沒有 type 時預設為 abcd
-    if (merged.quizzes) {
-      merged.quizzes.forEach(q => {
-        if (q.questions) {
-          q.questions.forEach(qq => {
-            if (!qq.type) qq.type = 'abcd';
-            if (qq.type === 'tf' && qq.options.length === 4) {
-              // 從 ABCD 改成 TF？保持原狀不動
-            }
-          });
-        }
-      });
-    }
-    // Migration: 如果有學生但冇任何班級，自動建一個「未分班」
-    if (merged.classes.length === 0 && merged.students.length > 0) {
-      merged.classes.push({
-        id: uid('cls'),
-        name: '未分班',
+    if (!merged.sessions) merged.sessions = [];
+    // 自動建 admin user 接管舊資料
+    if (merged.users.length === 0 && (
+        merged.classes.length > 0 || merged.students.length > 0 ||
+        merged.quizzes.length > 0 || merged.sessions.length > 0)) {
+      const adminId = 'admin-bootstrap';
+      merged.users.push({
+        id: adminId, username: 'admin', passwordHash: '',
+        displayName: '👑 管理員（舊資料）', isAdmin: true, isBootstrap: true,
         createdAt: Date.now(),
       });
-      // 將所有學生放入「未分班」
+      (merged.classes || []).forEach(c => { if (!c.ownerId) c.ownerId = adminId; });
+      (merged.students || []).forEach(s => { if (!s.ownerId) s.ownerId = adminId; });
+      (merged.quizzes || []).forEach(q => { if (!q.ownerId) q.ownerId = adminId; });
+      (merged.sessions || []).forEach(sess => { if (!sess.ownerId) sess.ownerId = adminId; });
+    }
+    (merged.students || []).forEach(s => {
+      if (typeof s.classId === 'undefined') s.classId = null;
+    });
+    (merged.quizzes || []).forEach(q => {
+      if (q.questions) {
+        q.questions.forEach(qq => { if (!qq.type) qq.type = 'abcd'; });
+      }
+      if (typeof q.folderId === 'undefined') q.folderId = null;
+    });
+    if (merged.classes.length === 0 && merged.students.length > 0) {
+      const adminId = merged.users[0]?.id || null;
+      merged.classes.push({
+        id: uid('cls'), ownerId: adminId, name: '未分班', createdAt: Date.now(),
+      });
       const defaultCls = merged.classes[0].id;
       merged.students.forEach(s => { s.classId = defaultCls; });
+    }
+    // 確認登入狀態仍然有效
+    const sessionUid = loadSessionUserId();
+    if (sessionUid && !merged.users.find(u => u.id === sessionUid)) {
+      saveSessionUserId(null);
+      merged.currentUserId = null;
+    } else if (sessionUid) {
+      merged.currentUserId = sessionUid;
+    } else {
+      merged.currentUserId = null;
     }
     return merged;
   } catch (e) {
@@ -76,6 +105,129 @@ function saveState() {
 
 function uid(prefix = 'id') {
   return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+/* ================================================
+   1b. Auth (註冊 / 登入 / 登出)
+   ⚠️ 純前端，無後端保護。密碼只係基本防呆用。
+   ================================================ */
+
+// 用 PBKDF2 雜湊密碼
+async function hashPassword(password) {
+  const enc = new TextEncoder();
+  const keyMaterial = await crypto.subtle.importKey(
+    'raw', enc.encode(password), { name: 'PBKDF2' }, false, ['deriveBits']
+  );
+  const saltBytes = enc.encode('classview-salt-v1');
+  const derivedBits = await crypto.subtle.deriveBits(
+    { name: 'PBKDF2', salt: saltBytes, iterations: 100000, hash: 'SHA-256' },
+    keyMaterial, 256
+  );
+  return Array.from(new Uint8Array(derivedBits))
+    .map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+function currentUser() {
+  if (!state.currentUserId) return null;
+  return state.users.find(u => u.id === state.currentUserId) || null;
+}
+
+function isLoggedIn() {
+  return !!currentUser();
+}
+
+function isAdmin() {
+  const u = currentUser();
+  return !!(u && u.isAdmin);
+}
+
+async function registerUser(username, password, displayName) {
+  username = (username || '').trim();
+  displayName = (displayName || '').trim() || username;
+  if (!username) return { ok: false, msg: '請輸入用戶名' };
+  if (username.length < 2) return { ok: false, msg: '用戶名至少 2 個字' };
+  if (!password || password.length < 4) return { ok: false, msg: '密碼至少 4 個字' };
+  if (state.users.some(u => u.username.toLowerCase() === username.toLowerCase())) {
+    return { ok: false, msg: '用戶名已被使用' };
+  }
+  const isFirst = state.users.length === 0;
+  const passwordHash = await hashPassword(password);
+  const user = {
+    id: uid('u'), username, passwordHash, displayName,
+    isAdmin: isFirst, createdAt: Date.now(),
+  };
+  state.users.push(user);
+  state.currentUserId = user.id;
+  saveSessionUserId(user.id);
+  saveState();
+  return { ok: true, user };
+}
+
+async function loginUser(username, password) {
+  username = (username || '').trim();
+  if (!username || !password) return { ok: false, msg: '請輸入用戶名同密碼' };
+  const user = state.users.find(u => u.username.toLowerCase() === username.toLowerCase());
+  if (!user) return { ok: false, msg: '用戶名或密碼錯誤' };
+  if (user.isBootstrap && state.users.length > 1) {
+    return { ok: false, msg: '請先註冊帳號再用戶名登入' };
+  }
+  const passwordHash = await hashPassword(password);
+  if (passwordHash !== user.passwordHash) {
+    return { ok: false, msg: '用戶名或密碼錯誤' };
+  }
+  state.currentUserId = user.id;
+  saveSessionUserId(user.id);
+  saveState();
+  return { ok: true, user };
+}
+
+function logoutUser() {
+  state.currentUserId = null;
+  saveSessionUserId(null);
+  if (state.currentSession) { state.currentSession = null; saveState(); }
+}
+
+/* ================================================
+   1c. 過濾 helpers (per-user visibility)
+   ================================================ */
+function myQuizzes() {
+  const u = currentUser();
+  if (!u) return [];
+  if (u.isAdmin) return state.quizzes;
+  return myQuizzes().filter(q => q.ownerId === u.id);
+}
+
+function myFolders() {
+  const u = currentUser();
+  if (!u) return [];
+  return state.folders.filter(f => f.ownerId === u.id);
+}
+
+function visibleStudents() {
+  const u = currentUser();
+  if (!u) return [];
+  if (u.isAdmin) return state.students;
+  const adminIds = state.users.filter(x => x.isAdmin).map(x => x.id);
+  return visibleStudents().filter(s =>
+    s.ownerId === u.id || (s.ownerId && adminIds.includes(s.ownerId))
+  );
+}
+
+function visibleClasses() {
+  const u = currentUser();
+  if (!u) return [];
+  if (u.isAdmin) return state.classes;
+  const adminIds = state.users.filter(x => x.isAdmin).map(x => x.id);
+  return visibleClasses().filter(c =>
+    c.ownerId === u.id || (c.ownerId && adminIds.includes(c.ownerId))
+  );
+}
+
+function visibleSessions() {
+  const u = currentUser();
+  if (!u) return [];
+  if (u.isAdmin) return state.sessions;
+  return visibleSessions().filter(s => s.ownerId === u.id);
 }
 
 /* ================================================
@@ -161,6 +313,125 @@ document.querySelectorAll('.nav-btn').forEach(btn => {
    ================================================ */
 const views = {};
 
+/* ---------- Login / Register ---------- */
+views.login = () => {
+  const isFirstUser = state.users.length === 0;
+  return `
+    <div style="max-width: 480px; margin: 40px auto;">
+      <h2 class="view-title" style="text-align: center;">${isFirstUser ? '🎉 歡迎使用 ClassView' : '🔐 登入'}</h2>
+      ${isFirstUser
+        ? `<p class="view-subtitle" style="text-align: center;">第一個註冊嘅用戶會自動成為 👑 管理員</p>`
+        : `<p class="view-subtitle" style="text-align: center;">用你嘅老師帳號登入</p>`}
+      <div class="card">
+        <div class="form-group">
+          <label class="form-label">用戶名</label>
+          <input type="text" id="loginUsername" class="form-input" placeholder="例：keith, mrchan" autofocus>
+        </div>
+        <div class="form-group">
+          <label class="form-label">密碼</label>
+          <input type="password" id="loginPassword" class="form-input" placeholder="至少 4 個字">
+        </div>
+        <div class="form-group" id="registerDisplayNameGroup" style="display: none;">
+          <label class="form-label">顯示名稱</label>
+          <input type="text" id="registerDisplayName" class="form-input" placeholder="例：陳老師、Mr. Chan">
+        </div>
+        <div id="loginError" class="text-muted" style="color: var(--c-danger); margin-bottom: 8px; min-height: 18px;"></div>
+        <button class="btn btn-primary btn-lg btn-block" id="loginSubmitBtn" onclick="doLogin()">🚀 ${isFirstUser ? '建立管理員帳號並登入' : '登入'}</button>
+        ${!isFirstUser ? `<button class="btn btn-ghost btn-block mt-2" onclick="toggleRegisterMode()">📝 註冊新帳號</button>` : ''}
+        <div class="text-muted text-sm" style="text-align: center; margin-top: 16px;">
+          ⚠️ 純前端儲存，密碼只係防呆用。所有用戶共用同一台裝置嘅 localStorage。
+        </div>
+      </div>
+    </div>
+  `;
+};
+
+window.doLogin = async function() {
+  const username = document.getElementById('loginUsername')?.value;
+  const password = document.getElementById('loginPassword')?.value;
+  const displayName = document.getElementById('registerDisplayName')?.value;
+  const errEl = document.getElementById('loginError');
+  const isRegister = document.getElementById('registerDisplayNameGroup')?.style.display !== 'none';
+  if (errEl) errEl.textContent = '';
+  const result = isRegister
+    ? await registerUser(username, password, displayName)
+    : await loginUser(username, password);
+  if (!result.ok) {
+    if (errEl) errEl.textContent = '❌ ' + result.msg;
+    return;
+  }
+  toast(`歡迎，${result.user.displayName}！`, 'success');
+  renderUserButton();
+  setView('home');
+};
+
+window.toggleRegisterMode = function() {
+  const group = document.getElementById('registerDisplayNameGroup');
+  if (!group) return;
+  const isShowing = group.style.display !== 'none';
+  group.style.display = isShowing ? 'none' : '';
+  const btn = document.getElementById('loginSubmitBtn');
+  if (btn) btn.textContent = isShowing ? '🚀 登入' : '🚀 註冊並登入';
+};
+
+function renderUserButton() {
+  const u = currentUser();
+  const nav = document.getElementById('mainNav');
+  if (!nav) return;
+  const old = document.getElementById('userNavBtn');
+  if (old) old.remove();
+  if (!u) return;
+  const btn = document.createElement('button');
+  btn.id = 'userNavBtn';
+  btn.className = 'nav-btn';
+  btn.style.cssText = 'background: ' + (u.isAdmin ? '#fbbf24' : '#60a5fa') + '; color: #1a1a1a; font-weight: 700;';
+  btn.innerHTML = `${u.isAdmin ? '👑' : '👤'} ${escapeHtml(u.displayName)} ▾`;
+  btn.onclick = () => showUserMenu();
+  nav.appendChild(btn);
+}
+
+function showUserMenu() {
+  const u = currentUser();
+  if (!u) return;
+  openModal(`
+    <div class="modal-header">
+      <div class="modal-title">${u.isAdmin ? '👑' : '👤'} ${escapeHtml(u.displayName)}</div>
+      <button class="modal-close" onclick="closeModal()">×</button>
+    </div>
+    <div class="form-group">
+      <div class="text-muted text-sm">用戶名</div>
+      <div style="font-size: 18px; font-weight: 700;">${escapeHtml(u.username)}</div>
+    </div>
+    <div class="form-group">
+      <div class="text-muted text-sm">角色</div>
+      <div>${u.isAdmin ? '👑 管理員' : '👨‍🏫 老師'}</div>
+    </div>
+    ${u.isAdmin ? `
+    <div class="form-group">
+      <div class="text-muted text-sm">管理員專屬</div>
+      <div class="row" style="gap: 6px; flex-wrap: wrap;">
+        <button class="btn btn-ghost btn-sm" onclick="closeModal(); setView('classes');">🏫 管理所有班級</button>
+        <button class="btn btn-ghost btn-sm" onclick="closeModal(); setView('students');">👨‍🎓 管理所有學生</button>
+      </div>
+      <div class="form-hint">管理員加入嘅學生/班級會自動共享俾所有老師用</div>
+    </div>
+    ` : ''}
+    <div class="row-end mt-2">
+      <button class="btn btn-ghost" onclick="closeModal()">關閉</button>
+      <button class="btn btn-danger" onclick="doLogout()">🚪 登出</button>
+    </div>
+  `);
+}
+
+window.doLogout = function() {
+  if (!confirm('確定登出？')) return;
+  logoutUser();
+  closeModal();
+  toast('已登出', 'success');
+  renderUserButton();
+  setView('login');
+};
+
 /* ---------- Home ---------- */
 views.home = () => `
   <h2 class="view-title">👋 歡迎使用 ClassView 答題卡</h2>
@@ -168,19 +439,19 @@ views.home = () => `
 
   <div class="stats-grid">
     <div class="stat-card">
-      <div class="stat-num">${state.quizzes.length}</div>
+      <div class="stat-num">${myQuizzes().length}</div>
       <div class="stat-label">📝 題目庫</div>
     </div>
     <div class="stat-card">
-      <div class="stat-num">${state.classes.length}</div>
+      <div class="stat-num">${visibleClasses().length}</div>
       <div class="stat-label">🏫 班級</div>
     </div>
     <div class="stat-card">
-      <div class="stat-num">${state.students.length}</div>
+      <div class="stat-num">${visibleStudents().length}</div>
       <div class="stat-label">👨‍🎓 已加入學生</div>
     </div>
     <div class="stat-card">
-      <div class="stat-num">${state.sessions.length}</div>
+      <div class="stat-num">${visibleSessions().length}</div>
       <div class="stat-label">📊 已完成答題</div>
     </div>
   </div>
@@ -224,7 +495,7 @@ views.home = () => `
 
 /* ---------- Quizzes (List + Edit) ---------- */
 views.quizzes = () => {
-  const quizList = state.quizzes.map(q => `
+  const quizList = myQuizzes().map(q => `
     <div class="card">
       <div class="row-between">
         <div>
@@ -248,7 +519,7 @@ views.quizzes = () => {
       </div>
       <button class="btn btn-primary btn-lg" onclick="newQuiz()">➕ 新增題目</button>
     </div>
-    ${state.quizzes.length === 0
+    ${myQuizzes().length === 0
       ? `<div class="empty"><div class="empty-icon">📝</div><div class="empty-title">還沒有題目</div><p>點「新增題目」開始建立</p></div>`
       : quizList
     }
@@ -260,9 +531,9 @@ views.students = (params = {}) => {
   const filterClass = params.filterClass || 'all';
   const filtered = filterClass === 'all'
     ? state.students
-    : state.students.filter(s => s.classId === filterClass);
+    : visibleStudents().filter(s => s.classId === filterClass);
   const grid = filtered.map(s => {
-    const cls = state.classes.find(c => c.id === s.classId);
+    const cls = visibleClasses().find(c => c.id === s.classId);
     return `
     <div class="student-card">
       <div class="avatar">${escapeHtml((s.name || '?').slice(0, 1))}</div>
@@ -276,11 +547,11 @@ views.students = (params = {}) => {
   `;
   }).join('');
 
-  const filterHtml = state.classes.length > 0 ? `
+  const filterHtml = visibleClasses().length > 0 ? `
     <div class="row" style="gap: 8px; flex-wrap: wrap; margin-bottom: 12px;">
-      <button class="btn ${filterClass === 'all' ? 'btn-primary' : 'btn-ghost'} btn-sm" onclick="setView('students', {filterClass:'all'})">全部 (${state.students.length})</button>
-      ${state.classes.map(c => {
-        const cnt = state.students.filter(s => s.classId === c.id).length;
+      <button class="btn ${filterClass === 'all' ? 'btn-primary' : 'btn-ghost'} btn-sm" onclick="setView('students', {filterClass:'all'})">全部 (${visibleStudents().length})</button>
+      ${visibleClasses().map(c => {
+        const cnt = visibleStudents().filter(s => s.classId === c.id).length;
         return `<button class="btn ${filterClass === c.id ? 'btn-primary' : 'btn-ghost'} btn-sm" onclick="setView('students', {filterClass:'${c.id}'})">${escapeHtml(c.name)} (${cnt})</button>`;
       }).join('')}
     </div>
@@ -299,7 +570,7 @@ views.students = (params = {}) => {
       </div>
     </div>
     ${filterHtml}
-    ${state.classes.length === 0 ? `<div class="card" style="background: #fef3c7; border-left: 4px solid #f59e0b; margin-bottom: 12px;">
+    ${visibleClasses().length === 0 ? `<div class="card" style="background: #fef3c7; border-left: 4px solid #f59e0b; margin-bottom: 12px;">
       <div>⚠️ 暫無班級。新增學生前請先去 <a href="#" onclick="setView('classes'); return false;" style="color: var(--c-primary); text-decoration: underline;">「班級」</a> 頁面建立班級，或者用 <b>EXCEL 匯入</b> 一次過搞掂（含班級資料）。</div>
     </div>` : ''}
     ${filtered.length === 0
@@ -311,8 +582,8 @@ views.students = (params = {}) => {
 
 /* ---------- Classes ---------- */
 views.classes = () => {
-  const list = state.classes.map(c => {
-    const studentCount = state.students.filter(s => s.classId === c.id).length;
+  const list = visibleClasses().map(c => {
+    const studentCount = visibleStudents().filter(s => s.classId === c.id).length;
     return `
       <div class="card">
         <div class="row-between" style="flex-wrap: wrap; gap: 12px;">
@@ -337,7 +608,7 @@ views.classes = () => {
       </div>
       <button class="btn btn-primary btn-lg" onclick="newClass()">➕ 新增班級</button>
     </div>
-    ${state.classes.length === 0
+    ${visibleClasses().length === 0
       ? `<div class="empty"><div class="empty-icon">🏫</div><div class="empty-title">還沒有班級</div><p>先建立班級，例如：3A、4B、晨曦組</p>
          <button class="btn btn-primary mt-2" onclick="newClass()">➕ 新增第一個班級</button>
          </div>`
@@ -348,7 +619,7 @@ views.classes = () => {
 
 /* ---------- Cards (Print) ---------- */
 views.cards = () => {
-  if (state.students.length === 0) {
+  if (visibleStudents().length === 0) {
     return `
       <h2 class="view-title">🖨️ 紙卡列印</h2>
       <div class="empty"><div class="empty-icon">🖨️</div><div class="empty-title">先加入學生</div><p>到「學生」頁面加入學生後，就可以列印紙卡</p></div>
@@ -389,7 +660,7 @@ views.cards_after = () => {
   if (!grid) return;
 
   // 每個學生 6 張卡
-  state.students.forEach(student => {
+  visibleStudents().forEach(student => {
     const fullName = student.name || '';
     const num = student.number;
 
@@ -434,7 +705,7 @@ views.cards_after = () => {
 
 /* ---------- Live Mode ---------- */
 views.live = (params) => {
-  if (state.quizzes.length === 0) {
+  if (myQuizzes().length === 0) {
     return `
       <h2 class="view-title">▶️ 答題模式</h2>
       <div class="empty"><div class="empty-icon">📝</div><div class="empty-title">先建立題目</div><p>到「題目」頁面建立題目後就可以開始</p></div>
@@ -450,16 +721,16 @@ views.live = (params) => {
         <div class="form-group">
           <label class="form-label">選擇題目</label>
           <select id="liveQuizSelect" class="form-select">
-            ${state.quizzes.map(q => `<option value="${q.id}">${escapeHtml(q.title)} (${q.questions.length} 題)</option>`).join('')}
+            ${myQuizzes().map(q => `<option value="${q.id}">${escapeHtml(q.title)} (${q.questions.length} 題)</option>`).join('')}
           </select>
         </div>
-        ${state.classes.length > 0 ? `
+        ${visibleClasses().length > 0 ? `
         <div class="form-group">
           <label class="form-label">參與班級</label>
           <select id="liveClassSelect" class="form-select">
-            <option value="all">全部班級 (${state.students.length} 位)</option>
-            ${state.classes.map(c => {
-              const cnt = state.students.filter(s => s.classId === c.id).length;
+            <option value="all">全部班級 (${visibleStudents().length} 位)</option>
+            ${visibleClasses().map(c => {
+              const cnt = visibleStudents().filter(s => s.classId === c.id).length;
               return `<option value="${c.id}">${escapeHtml(c.name)} (${cnt} 位)</option>`;
             }).join('')}
           </select>
@@ -492,7 +763,7 @@ views.live = (params) => {
 
 /* ---------- Results ---------- */
 views.results = () => {
-  if (state.sessions.length === 0) {
+  if (visibleSessions().length === 0) {
     return `
       <h2 class="view-title">📊 答題結果</h2>
       <div class="empty"><div class="empty-icon">📊</div><div class="empty-title">還沒有答題紀錄</div><p>完成一次答題後會顯示在這裡</p></div>
@@ -519,12 +790,12 @@ views.results = () => {
        </div>`;
 
   // 顯示每個 session 嘅 summary
-  const list = state.sessions.slice().reverse().map(s => {
-    const quiz = state.quizzes.find(q => q.id === s.quizId);
+  const list = visibleSessions().slice().reverse().map(s => {
+    const quiz = myQuizzes().find(q => q.id === s.quizId);
     const clsId = s.classId || 'all';
     const sessStudents = (clsId === 'all' || !clsId)
       ? state.students
-      : state.students.filter(stu => stu.classId === clsId);
+      : visibleStudents().filter(stu => stu.classId === clsId);
     const sessClassName = clsId === 'all' ? '全部' : className(clsId);
     const answered = Object.keys(s.answers || {}).length;
     const totalStudents = sessStudents.length;
@@ -597,7 +868,9 @@ function confirmNewQuiz() {
   if (!title) { toast('請輸入題目名稱', 'error'); return; }
   const quiz = {
     id: uid('q'),
+    ownerId: currentUser()?.id || null,
     title,
+    folderId: null,
     questions: [createEmptyQuestion()],
     createdAt: Date.now(),
   };
@@ -636,7 +909,7 @@ function createEmptyQuestion(type = 'abcd') {
 }
 
 function editQuiz(quizId) {
-  const quiz = state.quizzes.find(q => q.id === quizId);
+  const quiz = myQuizzes().find(q => q.id === quizId);
   if (!quiz) return;
 
   const questionsHtml = quiz.questions.map((q, idx) => renderQuestionEditor(q, idx)).join('');
@@ -730,7 +1003,7 @@ function toggleCorrect(qid, optId) {
 }
 
 function addQuestion(quizId) {
-  const quiz = state.quizzes.find(q => q.id === quizId);
+  const quiz = myQuizzes().find(q => q.id === quizId);
   if (!quiz) return;
 
   // 顯示選擇題型 modal
@@ -762,7 +1035,7 @@ function addQuestion(quizId) {
 }
 
 function confirmAddQuestion(quizId, type) {
-  const quiz = state.quizzes.find(q => q.id === quizId);
+  const quiz = myQuizzes().find(q => q.id === quizId);
   if (!quiz) return;
   quiz.questions.push(createEmptyQuestion(type));
   saveState();
@@ -771,7 +1044,7 @@ function confirmAddQuestion(quizId, type) {
 }
 
 function deleteQuestion(qid) {
-  const quiz = state.quizzes.find(q => q.questions.some(qq => qq.id === qid));
+  const quiz = myQuizzes().find(q => q.questions.some(qq => qq.id === qid));
   if (!quiz) return;
   if (quiz.questions.length <= 1) { toast('至少要留一題', 'warning'); return; }
   if (!confirm('確定刪除此題？')) return;
@@ -781,7 +1054,7 @@ function deleteQuestion(qid) {
 }
 
 function saveQuizEdit(quizId) {
-  const quiz = state.quizzes.find(q => q.id === quizId);
+  const quiz = myQuizzes().find(q => q.id === quizId);
   if (!quiz) return;
   const title = document.getElementById('quizTitle').value.trim();
   if (!title) { toast('請輸入題目名稱', 'error'); return; }
@@ -832,14 +1105,14 @@ window.confirmAddQuestion = confirmAddQuestion;
 function classOptions(selectedId = null, includeNull = false) {
   let opts = '';
   if (includeNull) opts += '<option value="">（不指定）</option>';
-  state.classes.forEach(c => {
+  visibleClasses().forEach(c => {
     opts += `<option value="${c.id}" ${c.id === selectedId ? 'selected' : ''}>${escapeHtml(c.name)}</option>`;
   });
   return opts;
 }
 
 function className(classId) {
-  const c = state.classes.find(x => x.id === classId);
+  const c = visibleClasses().find(x => x.id === classId);
   return c ? c.name : '—';
 }
 
@@ -856,11 +1129,11 @@ function newStudent() {
     <div class="form-group">
       <label class="form-label">所屬班級</label>
       <select id="studentClass" class="form-select">
-        ${state.classes.length === 0
+        ${visibleClasses().length === 0
           ? '<option value="">（請先去「班級」頁面建立班級）</option>'
           : classOptions(state.classes[0].id)}
       </select>
-      <div class="form-hint">${state.classes.length === 0 ? '暫無班級，請先建立' : '可之後再改'}</div>
+      <div class="form-hint">${visibleClasses().length === 0 ? '暫無班級，請先建立' : '可之後再改'}</div>
     </div>
     <div class="row-end">
       <button class="btn btn-ghost" onclick="closeModal()">取消</button>
@@ -876,9 +1149,10 @@ function confirmNewStudent() {
   const classId = document.getElementById('studentClass')?.value || null;
   const student = {
     id: uid('s'),
+    ownerId: currentUser()?.id || null,
     name,
-    classId: classId || (state.classes[0]?.id || null),
-    number: state.students.length + 1,
+    classId: classId || (visibleClasses()[0]?.id || null),
+    number: visibleStudents().length + 1,
     createdAt: Date.now(),
   };
   state.students.push(student);
@@ -889,7 +1163,7 @@ function confirmNewStudent() {
 }
 
 function editStudent(sid) {
-  const s = state.students.find(x => x.id === sid);
+  const s = visibleStudents().find(x => x.id === sid);
   if (!s) return;
   openModal(`
     <div class="modal-header">
@@ -915,7 +1189,7 @@ function editStudent(sid) {
 }
 
 function confirmEditStudent(sid) {
-  const s = state.students.find(x => x.id === sid);
+  const s = visibleStudents().find(x => x.id === sid);
   if (!s) return;
   const name = document.getElementById('studentName').value.trim();
   if (!name) { toast('請輸入姓名', 'error'); return; }
@@ -929,12 +1203,12 @@ function confirmEditStudent(sid) {
 }
 
 function deleteStudent(sid) {
-  const s = state.students.find(x => x.id === sid);
+  const s = visibleStudents().find(x => x.id === sid);
   if (!s) return;
   if (!confirm(`確定刪除 ${s.name}？`)) return;
   state.students = state.students.filter(x => x.id !== sid);
   // 重新編號
-  state.students.forEach((x, i) => x.number = i + 1);
+  visibleStudents().forEach((x, i) => x.number = i + 1);
   saveState();
   setView('students');
   toast('已刪除', 'success');
@@ -949,7 +1223,7 @@ function bulkAddStudents() {
     <div class="form-group">
       <label class="form-label">所屬班級</label>
       <select id="bulkClass" class="form-select">
-        ${state.classes.length === 0
+        ${visibleClasses().length === 0
           ? '<option value="">（請先去「班級」頁面建立）</option>'
           : classOptions(state.classes[0].id)}
       </select>
@@ -971,11 +1245,12 @@ function confirmBulkAdd() {
   const raw = document.getElementById('bulkNames').value;
   const names = raw.split('\n').map(s => s.trim()).filter(Boolean);
   if (names.length === 0) { toast('請輸入至少一個名字', 'error'); return; }
-  const classId = document.getElementById('bulkClass')?.value || (state.classes[0]?.id || null);
-  let nextNum = state.students.length + 1;
+  const classId = document.getElementById('bulkClass')?.value || (visibleClasses()[0]?.id || null);
+  let nextNum = visibleStudents().length + 1;
   names.forEach(name => {
     state.students.push({
       id: uid('s'),
+      ownerId: currentUser()?.id || null,
       name,
       classId,
       number: nextNum++,
@@ -1014,12 +1289,13 @@ function confirmNewClass() {
   const name = document.getElementById('className').value.trim();
   if (!name) { toast('請輸入班級名稱', 'error'); return; }
   // 重名檢查
-  if (state.classes.some(c => c.name === name)) {
+  if (visibleClasses().some(c => c.name === name)) {
     toast('已有同名班級', 'error');
     return;
   }
   const cls = {
     id: uid('cls'),
+    ownerId: currentUser()?.id || null,
     name,
     createdAt: Date.now(),
   };
@@ -1031,7 +1307,7 @@ function confirmNewClass() {
 }
 
 function editClass(cid) {
-  const c = state.classes.find(x => x.id === cid);
+  const c = visibleClasses().find(x => x.id === cid);
   if (!c) return;
   openModal(`
     <div class="modal-header">
@@ -1051,11 +1327,11 @@ function editClass(cid) {
 }
 
 function confirmEditClass(cid) {
-  const c = state.classes.find(x => x.id === cid);
+  const c = visibleClasses().find(x => x.id === cid);
   if (!c) return;
   const name = document.getElementById('className').value.trim();
   if (!name) { toast('請輸入班級名稱', 'error'); return; }
-  if (state.classes.some(x => x.id !== cid && x.name === name)) {
+  if (visibleClasses().some(x => x.id !== cid && x.name === name)) {
     toast('已有同名班級', 'error');
     return;
   }
@@ -1067,9 +1343,9 @@ function confirmEditClass(cid) {
 }
 
 function deleteClass(cid) {
-  const c = state.classes.find(x => x.id === cid);
+  const c = visibleClasses().find(x => x.id === cid);
   if (!c) return;
-  const studentCount = state.students.filter(s => s.classId === cid).length;
+  const studentCount = visibleStudents().filter(s => s.classId === cid).length;
   if (studentCount > 0) {
     toast(`「${c.name}」仲有 ${studentCount} 位學生，請先將學生移到其他班`, 'error');
     return;
@@ -1085,7 +1361,7 @@ function deleteClass(cid) {
    7c. EXCEL 匯入學生
    ================================================ */
 function importStudentsExcel() {
-  if (state.classes.length === 0) {
+  if (visibleClasses().length === 0) {
     toast('請先建立至少一個班級', 'error');
     setView('classes');
     return;
@@ -1163,7 +1439,7 @@ function handleExcelFile(ev) {
         const number = String(r[cols.number] || '').trim();
         const name = String(r[cols.name] || '').trim();
         if (!name) return null;
-        if (className && !state.classes.some(c => c.name === className) && !newClasses.some(c => c.name === className)) {
+        if (className && !visibleClasses().some(c => c.name === className) && !newClasses.some(c => c.name === className)) {
           newClasses.push({ name: className });
         }
         return { className, number, name };
@@ -1198,19 +1474,20 @@ function confirmImportExcel() {
   }
   // 建立新班級
   const clsMap = {}; // name -> id
-  state.classes.forEach(c => clsMap[c.name] = c.id);
+  visibleClasses().forEach(c => clsMap[c.name] = c.id);
   _importedStudents.newClasses.forEach(nc => {
     const id = uid('cls');
-    state.classes.push({ id, name: nc.name, createdAt: Date.now() });
+    state.classes.push({ id, ownerId: currentUser()?.id || null, name: nc.name, createdAt: Date.now() });
     clsMap[nc.name] = id;
   });
   // 加入學生
-  let nextNum = state.students.length + 1;
+  let nextNum = visibleStudents().length + 1;
   let added = 0;
   _importedStudents.rows.forEach(r => {
     const cid = r.className ? clsMap[r.className] : (state.classes[0]?.id || null);
     state.students.push({
       id: uid('s'),
+      ownerId: currentUser()?.id || null,
       name: r.name,
       classId: cid,
       number: nextNum++,
@@ -1258,6 +1535,7 @@ let liveState = {
 function startLive(quizId, classId = 'all') {
   state.currentSession = {
     id: uid('sess'),
+    ownerId: currentUser()?.id || null,
     quizId,
     classId,  // 記住係邊個班答嘅
     startedAt: Date.now(),
@@ -1282,14 +1560,14 @@ window.startLiveSession = startLiveSession;
 function renderLiveStage() {
   const session = state.currentSession;
   if (!session) return '';
-  const quiz = state.quizzes.find(q => q.id === session.quizId);
+  const quiz = myQuizzes().find(q => q.id === session.quizId);
   if (!quiz) return '<div class="empty">題目不存在</div>';
 
   // 班級範圍
   const classId = session.classId || 'all';
   const sessionStudents = (classId === 'all' || !classId)
     ? state.students
-    : state.students.filter(s => s.classId === classId);
+    : visibleStudents().filter(s => s.classId === classId);
   const sessionClassName = classId === 'all'
     ? '全部班級'
     : className(classId);
@@ -1408,11 +1686,11 @@ function renderManualSection() {
   const classId = session.classId || 'all';
   const sessionStudents = (classId === 'all' || !classId)
     ? state.students
-    : state.students.filter(s => s.classId === classId);
+    : visibleStudents().filter(s => s.classId === classId);
   if (sessionStudents.length === 0) {
     return `<div class="card mt-2"><div class="empty"><div class="empty-icon">👨‍🎓</div><div class="empty-title">冇學生</div></div></div>`;
   }
-  const quiz = state.quizzes.find(q => q.id === session.quizId);
+  const quiz = myQuizzes().find(q => q.id === session.quizId);
   const q = quiz.questions[liveState.currentQIdx];
   const isTf = q.type === 'tf';
   const opts = isTf ? ['T', 'F'] : ['A', 'B', 'C', 'D'];
@@ -1443,7 +1721,7 @@ function renderManualSection() {
 
 function manualAnswer(sid, opt) {
   const session = state.currentSession;
-  const quiz = state.quizzes.find(q => q.id === session.quizId);
+  const quiz = myQuizzes().find(q => q.id === session.quizId);
   const q = quiz.questions[liveState.currentQIdx];
   if (!session.answers[sid]) session.answers[sid] = {};
   session.answers[sid][q.id] = opt;
@@ -1456,7 +1734,7 @@ function prevQuestion() {
 }
 function nextQuestion() {
   const session = state.currentSession;
-  const quiz = state.quizzes.find(q => q.id === session.quizId);
+  const quiz = myQuizzes().find(q => q.id === session.quizId);
   if (liveState.currentQIdx < quiz.questions.length - 1) {
     liveState.currentQIdx++;
     setView('live');
@@ -1493,7 +1771,7 @@ function showAnswerButtons(suggested) {
 function speakQuestion(qid) {
   const session = state.currentSession;
   if (!session) return;
-  const quiz = state.quizzes.find(q => q.id === session.quizId);
+  const quiz = myQuizzes().find(q => q.id === session.quizId);
   const q = quiz.questions.find(x => x.id === qid);
   if (!q) return;
   if (!('speechSynthesis' in window)) { toast('此裝置不支援語音', 'warning'); return; }
@@ -1596,11 +1874,11 @@ function stopScanner() {
 
 async function restartScannerForReview() {
   // 補掃模式：啟動鏡頭，用最後一個 session
-  if (state.sessions.length === 0) {
+  if (visibleSessions().length === 0) {
     toast('冇 session 可以補掃', 'warning');
     return;
   }
-  liveState.reviewSessionId = state.sessions[state.sessions.length - 1].id;
+  liveState.reviewSessionId = state.sessions[visibleSessions().length - 1].id;
   liveState.reviewQIdx = 0;  // 預設補掃第一題
   await startScanner();
   toast('已啟動補掃模式（添加到最新 session）', 'success');
@@ -1648,7 +1926,7 @@ function handleScannedQR(data) {
   }
   const sid = parts[0];
   const answer = parts[1];
-  const student = state.students.find(s => s.id === sid);
+  const student = visibleStudents().find(s => s.id === sid);
   if (!student) {
     showDetected('⚠️ 找不到此學生', true);
     return;
@@ -1659,16 +1937,16 @@ function handleScannedQR(data) {
   let qIdx = liveState.currentQIdx;
   let mode = 'live';
 
-  if (!session && state.sessions.length > 0) {
+  if (!session && visibleSessions().length > 0) {
     // 補掃：取最後一個 session
-    session = state.sessions[state.sessions.length - 1];
+    session = state.sessions[visibleSessions().length - 1];
     // 用 liveState 嘅 reviewQIdx
     qIdx = liveState.reviewQIdx ?? 0;
     mode = 'review';
   }
   if (!session) return;
 
-  const quiz = state.quizzes.find(q => q.id === session.quizId);
+  const quiz = myQuizzes().find(q => q.id === session.quizId);
   if (!quiz || !quiz.questions[qIdx]) {
     showDetected('⚠️ 無可用題目', true);
     return;
@@ -1780,13 +2058,13 @@ function showAnswerConfirmModal(student, q) {
 
 function confirmScanAnswer(sid, opt) {
   const session = state.currentSession;
-  const quiz = state.quizzes.find(q => q.id === session.quizId);
+  const quiz = myQuizzes().find(q => q.id === session.quizId);
   const q = quiz.questions[liveState.currentQIdx];
   if (!session.answers[sid]) session.answers[sid] = {};
   session.answers[sid][q.id] = opt;
   saveState();
   document.getElementById('answerConfirmArea').innerHTML = '';
-  const student = state.students.find(s => s.id === sid);
+  const student = visibleStudents().find(s => s.id === sid);
   toast(`${student?.name || '?'} → ${opt} ✓`, 'success');
   // 重新渲染以更新計數
   setView('live');
@@ -1799,16 +2077,16 @@ window.confirmScanAnswer = confirmScanAnswer;
    10. Results
    ================================================ */
 function viewSessionDetail(sid) {
-  const session = state.sessions.find(s => s.id === sid);
+  const session = visibleSessions().find(s => s.id === sid);
   if (!session) return;
-  const quiz = state.quizzes.find(q => q.id === session.quizId);
+  const quiz = myQuizzes().find(q => q.id === session.quizId);
   if (!quiz) { toast('題目已被刪除', 'error'); return; }
 
   // 班級範圍
   const clsId = session.classId || 'all';
   const sessStudents = (clsId === 'all' || !clsId)
     ? state.students
-    : state.students.filter(s => s.classId === clsId);
+    : visibleStudents().filter(s => s.classId === clsId);
   const sessClassName = clsId === 'all' ? '全部' : className(clsId);
 
   // 計算每位學生成績 + 逐題答案
@@ -1974,16 +2252,16 @@ function viewSessionDetail(sid) {
 window.viewSessionDetail = viewSessionDetail;
 
 function exportSession(sid) {
-  const session = state.sessions.find(s => s.id === sid);
+  const session = visibleSessions().find(s => s.id === sid);
   if (!session) return;
-  const quiz = state.quizzes.find(q => q.id === session.quizId);
+  const quiz = myQuizzes().find(q => q.id === session.quizId);
   if (!quiz) { toast('題目已被刪除', 'error'); return; }
 
   // 班級範圍
   const clsId = session.classId || 'all';
   const sessStudents = (clsId === 'all' || !clsId)
     ? state.students
-    : state.students.filter(s => s.classId === clsId);
+    : visibleStudents().filter(s => s.classId === clsId);
   const sessClassName = clsId === 'all' ? '全部' : className(clsId);
 
   // 將答案 ID 轉成用戶友善的顯示（T → ✓, F → ✗）
@@ -2064,19 +2342,22 @@ function formatDate(ts) {
 function loadDemoData() {
   if (!confirm('載入範例資料？現有資料會被保留（不會清除）。')) return;
   const demoStudents = ['小明', '小美', '阿強', '阿芳', '志明', '婉婷', '俊傑', '嘉欣'];
-  const existingCount = state.students.length;
+  const existingCount = visibleStudents().length;
   let nextNum = existingCount + 1;
   demoStudents.forEach(name => {
     state.students.push({
       id: uid('s'),
+      ownerId: currentUser()?.id || null,
       name,
       number: nextNum++,
       createdAt: Date.now(),
     });
   });
-  if (state.quizzes.length === 0) {
+  if (myQuizzes().length === 0) {
     state.quizzes.push({
       id: uid('q'),
+      ownerId: currentUser()?.id || null,
+      folderId: null,
       title: '一年級常識測驗（範例）',
       questions: [
         {
@@ -2140,9 +2421,15 @@ function init() {
   if (state.currentSession && state.currentSession.finishedAt) {
     state.currentSession = null;
   }
-  setView('home');
+  // 未登入就去 login view
+  if (!isLoggedIn()) {
+    setView('login');
+  } else {
+    setView('home');
+  }
+  renderUserButton();
 
-  // 暴露到 window（方便除錯 + E2E 測試）
+  // 暴露到 window
   window.state = state;
   window.saveState = saveState;
   window.setView = setView;
@@ -2161,6 +2448,14 @@ function init() {
   window.restartScannerForReview = restartScannerForReview;
   window.startScanner = startScanner;
   window.stopScanner = stopScanner;
+  window.currentUser = currentUser;
+  window.loginUser = loginUser;
+  window.registerUser = registerUser;
+  window.logoutUser = logoutUser;
+  window.myQuizzes = myQuizzes;
+  window.visibleStudents = visibleStudents;
+  window.visibleClasses = visibleClasses;
+  window.visibleSessions = visibleSessions;
 }
 
 init();
@@ -2186,7 +2481,7 @@ const ANSWER_TEXT = {
 };
 
 async function exportCardsPDF() {
-  if (state.students.length === 0) {
+  if (visibleStudents().length === 0) {
     toast('未有學生，無法匯出', 'error');
     return;
   }
@@ -2199,7 +2494,7 @@ async function exportCardsPDF() {
     return;
   }
 
-  const totalCards = state.students.length * ANSWER_TYPES.length;
+  const totalCards = visibleStudents().length * ANSWER_TYPES.length;
   toast(`生成 PDF 中…（共 ${totalCards} 頁）`, 'success');
 
   // 創建隱藏的渲染容器（A4 比例：210mm × 297mm）
@@ -2293,7 +2588,7 @@ async function exportCardsPDF() {
   // 清理
   container.remove();
 
-  const filename = `ClassView-紙卡-${state.students.length}位學生-${formatDate(Date.now())}.pdf`;
+  const filename = `ClassView-紙卡-${visibleStudents().length}位學生-${formatDate(Date.now())}.pdf`;
   pdf.save(filename);
   toast(`✓ PDF 已下載：${filename}（${cardIdx} 頁）`, 'success');
 }
@@ -2302,9 +2597,9 @@ async function exportCardsPDF() {
    14. EXCEL 報告匯出（使用 SheetJS）
    ================================================ */
 function exportSessionExcel(sid) {
-  const session = state.sessions.find(s => s.id === sid);
+  const session = visibleSessions().find(s => s.id === sid);
   if (!session) { toast('找不到 session', 'error'); return; }
-  const quiz = state.quizzes.find(q => q.id === session.quizId);
+  const quiz = myQuizzes().find(q => q.id === session.quizId);
   if (!quiz) { toast('題目已被刪除', 'error'); return; }
   if (!window.XLSX) { toast('EXCEL 庫未載入', 'error'); return; }
 
@@ -2312,7 +2607,7 @@ function exportSessionExcel(sid) {
   const clsId = session.classId || 'all';
   const sessStudents = (clsId === 'all' || !clsId)
     ? state.students
-    : state.students.filter(s => s.classId === clsId);
+    : visibleStudents().filter(s => s.classId === clsId);
   const sessClassName = clsId === 'all' ? '全部' : className(clsId);
 
   const ansLabel = (q, ans) => {
@@ -2420,9 +2715,9 @@ function exportSessionExcel(sid) {
    15. PDF 報告匯出（html2canvas + jsPDF）
    ================================================ */
 async function exportSessionPDF(sid) {
-  const session = state.sessions.find(s => s.id === sid);
+  const session = visibleSessions().find(s => s.id === sid);
   if (!session) { toast('找不到 session', 'error'); return; }
-  const quiz = state.quizzes.find(q => q.id === session.quizId);
+  const quiz = myQuizzes().find(q => q.id === session.quizId);
   if (!quiz) { toast('題目已被刪除', 'error'); return; }
   if (!window.html2canvas || !window.jspdf) { toast('PDF 庫未載入', 'error'); return; }
 
@@ -2430,7 +2725,7 @@ async function exportSessionPDF(sid) {
   const clsId = session.classId || 'all';
   const sessStudents = (clsId === 'all' || !clsId)
     ? state.students
-    : state.students.filter(s => s.classId === clsId);
+    : visibleStudents().filter(s => s.classId === clsId);
   const sessClassName = clsId === 'all' ? '全部' : className(clsId);
 
   toast('生成 PDF 報告中…', 'success');
@@ -2553,13 +2848,13 @@ async function exportSessionPDF(sid) {
   // 題目分析
   const qDistRows = quiz.questions.map((q, i) => {
     const ansAB = q.options.map(o => o.text);
-    const answeredCount = state.students.filter(s => session.answers[s.id]?.[q.id]).length;
-    const correctCount = state.students.filter(s => session.answers[s.id]?.[q.id] === q.correct).length;
+    const answeredCount = visibleStudents().filter(s => session.answers[s.id]?.[q.id]).length;
+    const correctCount = visibleStudents().filter(s => session.answers[s.id]?.[q.id] === q.correct).length;
     const rate = answeredCount > 0 ? Math.round((correctCount / answeredCount) * 100) : 0;
     const isTf = q.type === 'tf';
     const optIds = isTf ? ['T', 'F'] : ['A', 'B', 'C', 'D'];
     const distCells = optIds.map(opt => {
-      const count = state.students.filter(s => session.answers[s.id]?.[q.id] === opt).length;
+      const count = visibleStudents().filter(s => session.answers[s.id]?.[q.id] === opt).length;
       const isCorrect = opt === q.correct;
       return `<td style="padding: 4px; border: 1px solid #d1d5db; text-align: center; ${isCorrect ? 'background: #d1fae5; font-weight: 700; color: #16a34a;' : ''}">${isCorrect ? count + ' ✓' : count}</td>`;
     }).join('');
@@ -2570,7 +2865,7 @@ async function exportSessionPDF(sid) {
           <div style="font-size: 11px; color: #555; margin-top: 2px;">${escapeHtml(q.text.length > 40 ? q.text.slice(0, 40) + '…' : q.text)}</div>
         </td>
         <td style="padding: 6px; border: 1px solid #d1d5db; text-align: center;">${correctLabel(q)}</td>
-        <td style="padding: 6px; border: 1px solid #d1d5db; text-align: center;">${answeredCount}/${state.students.length}</td>
+        <td style="padding: 6px; border: 1px solid #d1d5db; text-align: center;">${answeredCount}/${visibleStudents().length}</td>
         <td style="padding: 6px; border: 1px solid #d1d5db; text-align: center; font-weight: 700; color: #16a34a;">${correctCount}</td>
         <td style="padding: 6px; border: 1px solid #d1d5db; text-align: center; font-weight: 700;">${rate}%</td>
         ${distCells}
