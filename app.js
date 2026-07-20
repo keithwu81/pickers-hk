@@ -12,7 +12,8 @@ const STORAGE_KEY = 'classview_plickers_v1';
 
 const defaultState = {
   quizzes: [],
-  students: [],
+  classes: [],   // 班級（{id, name, createdAt}）
+  students: [],  // 學生（{id, classId, number, name}）
   sessions: [],
   currentSession: null, // 進行中的 session 暫存
 };
@@ -25,6 +26,14 @@ function loadState() {
     if (!raw) return { ...defaultState };
     const parsed = JSON.parse(raw);
     const merged = { ...defaultState, ...parsed };
+    // Migration: 確保 classes 一定存在
+    if (!merged.classes) merged.classes = [];
+    // Migration: 確保每個 student 有 classId
+    if (merged.students) {
+      merged.students.forEach(s => {
+        if (typeof s.classId === 'undefined') s.classId = null;
+      });
+    }
     // 向後相容：舊資料沒有 type 時預設為 abcd
     if (merged.quizzes) {
       merged.quizzes.forEach(q => {
@@ -37,6 +46,17 @@ function loadState() {
           });
         }
       });
+    }
+    // Migration: 如果有學生但冇任何班級，自動建一個「未分班」
+    if (merged.classes.length === 0 && merged.students.length > 0) {
+      merged.classes.push({
+        id: uid('cls'),
+        name: '未分班',
+        createdAt: Date.now(),
+      });
+      // 將所有學生放入「未分班」
+      const defaultCls = merged.classes[0].id;
+      merged.students.forEach(s => { s.classId = defaultCls; });
     }
     return merged;
   } catch (e) {
@@ -152,6 +172,10 @@ views.home = () => `
       <div class="stat-label">📝 題目庫</div>
     </div>
     <div class="stat-card">
+      <div class="stat-num">${state.classes.length}</div>
+      <div class="stat-label">🏫 班級</div>
+    </div>
+    <div class="stat-card">
       <div class="stat-num">${state.students.length}</div>
       <div class="stat-label">👨‍🎓 已加入學生</div>
     </div>
@@ -232,18 +256,35 @@ views.quizzes = () => {
 };
 
 /* ---------- Students ---------- */
-views.students = () => {
-  const grid = state.students.map(s => `
+views.students = (params = {}) => {
+  const filterClass = params.filterClass || 'all';
+  const filtered = filterClass === 'all'
+    ? state.students
+    : state.students.filter(s => s.classId === filterClass);
+  const grid = filtered.map(s => {
+    const cls = state.classes.find(c => c.id === s.classId);
+    return `
     <div class="student-card">
       <div class="avatar">${escapeHtml((s.name || '?').slice(0, 1))}</div>
       <div class="name">${escapeHtml(s.name)}</div>
-      <div class="id">#${s.number} · ${s.id.slice(-6)}</div>
+      <div class="id">#${s.number} · ${escapeHtml(cls?.name || '未分班')}</div>
       <div class="row" style="justify-content: center; margin-top: 10px; gap: 6px;">
         <button class="btn btn-ghost btn-sm" onclick="editStudent('${s.id}')">✏️</button>
         <button class="btn btn-danger btn-sm" onclick="deleteStudent('${s.id}')">🗑️</button>
       </div>
     </div>
-  `).join('');
+  `;
+  }).join('');
+
+  const filterHtml = state.classes.length > 0 ? `
+    <div class="row" style="gap: 8px; flex-wrap: wrap; margin-bottom: 12px;">
+      <button class="btn ${filterClass === 'all' ? 'btn-primary' : 'btn-ghost'} btn-sm" onclick="setView('students', {filterClass:'all'})">全部 (${state.students.length})</button>
+      ${state.classes.map(c => {
+        const cnt = state.students.filter(s => s.classId === c.id).length;
+        return `<button class="btn ${filterClass === c.id ? 'btn-primary' : 'btn-ghost'} btn-sm" onclick="setView('students', {filterClass:'${c.id}'})">${escapeHtml(c.name)} (${cnt})</button>`;
+      }).join('')}
+    </div>
+  ` : '';
 
   return `
     <div class="row-between mb-2">
@@ -252,13 +293,55 @@ views.students = () => {
         <p class="view-subtitle">每個學生會自動產生專屬 QR code 紙卡</p>
       </div>
       <div class="row">
+        <button class="btn btn-ghost" onclick="importStudentsExcel()">📥 EXCEL 匯入</button>
         <button class="btn btn-ghost" onclick="bulkAddStudents()">📋 批次加入</button>
         <button class="btn btn-primary btn-lg" onclick="newStudent()">➕ 新增學生</button>
       </div>
     </div>
-    ${state.students.length === 0
-      ? `<div class="empty"><div class="empty-icon">👨‍🎓</div><div class="empty-title">還沒有學生</div><p>先加入學生才能派紙卡</p></div>`
+    ${filterHtml}
+    ${state.classes.length === 0 ? `<div class="card" style="background: #fef3c7; border-left: 4px solid #f59e0b; margin-bottom: 12px;">
+      <div>⚠️ 暫無班級。新增學生前請先去 <a href="#" onclick="setView('classes'); return false;" style="color: var(--c-primary); text-decoration: underline;">「班級」</a> 頁面建立班級，或者用 <b>EXCEL 匯入</b> 一次過搞掂（含班級資料）。</div>
+    </div>` : ''}
+    ${filtered.length === 0
+      ? `<div class="empty"><div class="empty-icon">👨‍🎓</div><div class="empty-title">${filterClass === 'all' ? '還沒有學生' : '呢個班冇學生'}</div><p>${filterClass === 'all' ? '點「新增學生」開始，或者用 EXCEL 匯入' : '切換其他班或加入學生'}</p></div>`
       : `<div class="student-grid">${grid}</div>`
+    }
+  `;
+};
+
+/* ---------- Classes ---------- */
+views.classes = () => {
+  const list = state.classes.map(c => {
+    const studentCount = state.students.filter(s => s.classId === c.id).length;
+    return `
+      <div class="card">
+        <div class="row-between" style="flex-wrap: wrap; gap: 12px;">
+          <div style="flex: 1; min-width: 200px;">
+            <div class="card-title">🏫 ${escapeHtml(c.name)}</div>
+            <div class="text-muted text-sm">${studentCount} 位學生 · 建立於 ${formatDate(c.createdAt)}</div>
+          </div>
+          <div class="row" style="gap: 6px;">
+            <button class="btn btn-ghost btn-sm" onclick="editClass('${c.id}')">✏️ 改名</button>
+            <button class="btn btn-danger btn-sm" onclick="deleteClass('${c.id}')" ${studentCount > 0 ? 'disabled title="請先將學生移到其他班"' : ''}>🗑️ 刪除</button>
+          </div>
+        </div>
+      </div>
+    `;
+  }).join('');
+
+  return `
+    <div class="row-between mb-2">
+      <div>
+        <h2 class="view-title">🏫 班級管理</h2>
+        <p class="view-subtitle">按班級分組學生，方便分批答題同匯出報告</p>
+      </div>
+      <button class="btn btn-primary btn-lg" onclick="newClass()">➕ 新增班級</button>
+    </div>
+    ${state.classes.length === 0
+      ? `<div class="empty"><div class="empty-icon">🏫</div><div class="empty-title">還沒有班級</div><p>先建立班級，例如：3A、4B、晨曦組</p>
+         <button class="btn btn-primary mt-2" onclick="newClass()">➕ 新增第一個班級</button>
+         </div>`
+      : list
     }
   `;
 };
@@ -370,6 +453,19 @@ views.live = (params) => {
             ${state.quizzes.map(q => `<option value="${q.id}">${escapeHtml(q.title)} (${q.questions.length} 題)</option>`).join('')}
           </select>
         </div>
+        ${state.classes.length > 0 ? `
+        <div class="form-group">
+          <label class="form-label">參與班級</label>
+          <select id="liveClassSelect" class="form-select">
+            <option value="all">全部班級 (${state.students.length} 位)</option>
+            ${state.classes.map(c => {
+              const cnt = state.students.filter(s => s.classId === c.id).length;
+              return `<option value="${c.id}">${escapeHtml(c.name)} (${cnt} 位)</option>`;
+            }).join('')}
+          </select>
+          <div class="form-hint">可以揀特定班（例如淨係畀 3A 答），或者全部一齊答</div>
+        </div>
+        ` : ''}
         <div class="form-group">
           <label class="form-label">答題模式</label>
           <div style="display: flex; gap: 12px; flex-wrap: wrap;">
@@ -425,19 +521,24 @@ views.results = () => {
   // 顯示每個 session 嘅 summary
   const list = state.sessions.slice().reverse().map(s => {
     const quiz = state.quizzes.find(q => q.id === s.quizId);
+    const clsId = s.classId || 'all';
+    const sessStudents = (clsId === 'all' || !clsId)
+      ? state.students
+      : state.students.filter(stu => stu.classId === clsId);
+    const sessClassName = clsId === 'all' ? '全部' : className(clsId);
     const answered = Object.keys(s.answers || {}).length;
-    const totalStudents = state.students.length;
-    const correct = quiz ? state.students.reduce((sum, stu) => {
+    const totalStudents = sessStudents.length;
+    const correct = quiz ? sessStudents.reduce((sum, stu) => {
       return sum + quiz.questions.filter(q => s.answers[stu.id]?.[q.id] === q.correct).length;
     }, 0) : 0;
-    const totalQ = quiz ? quiz.questions.length * state.students.length : 0;
+    const totalQ = quiz ? quiz.questions.length * sessStudents.length : 0;
     const acc = totalQ > 0 ? Math.round((correct / totalQ) * 100) : 0;
     return `
       <div class="card">
         <div class="row-between" style="flex-wrap: wrap; gap: 12px;">
           <div style="flex: 1; min-width: 200px;">
             <div class="card-title">${escapeHtml(quiz?.title || '已刪除題目')}</div>
-            <div class="text-muted text-sm">${formatDate(s.startedAt)} · 收到 ${answered}/${totalStudents} 份</div>
+            <div class="text-muted text-sm">${formatDate(s.startedAt)} · 🏫 ${escapeHtml(sessClassName)} · 收到 ${answered}/${totalStudents} 份</div>
           </div>
           <div class="row" style="gap: 16px;">
             <div class="text-center">
@@ -728,6 +829,20 @@ window.confirmAddQuestion = confirmAddQuestion;
 /* ================================================
    7. Student CRUD
    ================================================ */
+function classOptions(selectedId = null, includeNull = false) {
+  let opts = '';
+  if (includeNull) opts += '<option value="">（不指定）</option>';
+  state.classes.forEach(c => {
+    opts += `<option value="${c.id}" ${c.id === selectedId ? 'selected' : ''}>${escapeHtml(c.name)}</option>`;
+  });
+  return opts;
+}
+
+function className(classId) {
+  const c = state.classes.find(x => x.id === classId);
+  return c ? c.name : '—';
+}
+
 function newStudent() {
   openModal(`
     <div class="modal-header">
@@ -737,6 +852,15 @@ function newStudent() {
     <div class="form-group">
       <label class="form-label">學生姓名</label>
       <input type="text" id="studentName" class="form-input" placeholder="例：小明" autofocus>
+    </div>
+    <div class="form-group">
+      <label class="form-label">所屬班級</label>
+      <select id="studentClass" class="form-select">
+        ${state.classes.length === 0
+          ? '<option value="">（請先去「班級」頁面建立班級）</option>'
+          : classOptions(state.classes[0].id)}
+      </select>
+      <div class="form-hint">${state.classes.length === 0 ? '暫無班級，請先建立' : '可之後再改'}</div>
     </div>
     <div class="row-end">
       <button class="btn btn-ghost" onclick="closeModal()">取消</button>
@@ -749,9 +873,11 @@ function newStudent() {
 function confirmNewStudent() {
   const name = document.getElementById('studentName').value.trim();
   if (!name) { toast('請輸入姓名', 'error'); return; }
+  const classId = document.getElementById('studentClass')?.value || null;
   const student = {
     id: uid('s'),
     name,
+    classId: classId || (state.classes[0]?.id || null),
     number: state.students.length + 1,
     createdAt: Date.now(),
   };
@@ -774,6 +900,12 @@ function editStudent(sid) {
       <label class="form-label">姓名</label>
       <input type="text" id="studentName" class="form-input" value="${escapeAttr(s.name)}">
     </div>
+    <div class="form-group">
+      <label class="form-label">所屬班級</label>
+      <select id="studentClass" class="form-select">
+        ${classOptions(s.classId)}
+      </select>
+    </div>
     <div class="row-end">
       <button class="btn btn-ghost" onclick="closeModal()">取消</button>
       <button class="btn btn-primary" onclick="confirmEditStudent('${sid}')">儲存</button>
@@ -787,7 +919,9 @@ function confirmEditStudent(sid) {
   if (!s) return;
   const name = document.getElementById('studentName').value.trim();
   if (!name) { toast('請輸入姓名', 'error'); return; }
+  const classId = document.getElementById('studentClass')?.value || null;
   s.name = name;
+  s.classId = classId;
   saveState();
   closeModal();
   setView('students');
@@ -813,9 +947,17 @@ function bulkAddStudents() {
       <button class="modal-close" onclick="closeModal()">×</button>
     </div>
     <div class="form-group">
+      <label class="form-label">所屬班級</label>
+      <select id="bulkClass" class="form-select">
+        ${state.classes.length === 0
+          ? '<option value="">（請先去「班級」頁面建立）</option>'
+          : classOptions(state.classes[0].id)}
+      </select>
+    </div>
+    <div class="form-group">
       <label class="form-label">每行一位學生</label>
       <textarea id="bulkNames" class="form-textarea" rows="10" placeholder="小明&#10;小美&#10;阿強&#10;阿芳"></textarea>
-      <div class="form-hint">每行一個名字，可以用空格分隔（如「小明 1A」）</div>
+      <div class="form-hint">每行一個名字</div>
     </div>
     <div class="row-end">
       <button class="btn btn-ghost" onclick="closeModal()">取消</button>
@@ -829,11 +971,13 @@ function confirmBulkAdd() {
   const raw = document.getElementById('bulkNames').value;
   const names = raw.split('\n').map(s => s.trim()).filter(Boolean);
   if (names.length === 0) { toast('請輸入至少一個名字', 'error'); return; }
+  const classId = document.getElementById('bulkClass')?.value || (state.classes[0]?.id || null);
   let nextNum = state.students.length + 1;
   names.forEach(name => {
     state.students.push({
       id: uid('s'),
       name,
+      classId,
       number: nextNum++,
       createdAt: Date.now(),
     });
@@ -842,6 +986,243 @@ function confirmBulkAdd() {
   closeModal();
   setView('students');
   toast(`已加入 ${names.length} 位學生 ✓`, 'success');
+}
+
+/* ================================================
+   7b. Class CRUD
+   ================================================ */
+function newClass() {
+  openModal(`
+    <div class="modal-header">
+      <div class="modal-title">➕ 新增班級</div>
+      <button class="modal-close" onclick="closeModal()">×</button>
+    </div>
+    <div class="form-group">
+      <label class="form-label">班級名稱</label>
+      <input type="text" id="className" class="form-input" placeholder="例：3A、4B、晨曦組" autofocus>
+      <div class="form-hint">支援中英文，例如「1A」「三年甲班」「晨光組」</div>
+    </div>
+    <div class="row-end">
+      <button class="btn btn-ghost" onclick="closeModal()">取消</button>
+      <button class="btn btn-primary" onclick="confirmNewClass()">建立</button>
+    </div>
+  `);
+  setTimeout(() => document.getElementById('className')?.focus(), 100);
+}
+
+function confirmNewClass() {
+  const name = document.getElementById('className').value.trim();
+  if (!name) { toast('請輸入班級名稱', 'error'); return; }
+  // 重名檢查
+  if (state.classes.some(c => c.name === name)) {
+    toast('已有同名班級', 'error');
+    return;
+  }
+  const cls = {
+    id: uid('cls'),
+    name,
+    createdAt: Date.now(),
+  };
+  state.classes.push(cls);
+  saveState();
+  closeModal();
+  setView('classes');
+  toast(`已建立班級「${name}」 ✓`, 'success');
+}
+
+function editClass(cid) {
+  const c = state.classes.find(x => x.id === cid);
+  if (!c) return;
+  openModal(`
+    <div class="modal-header">
+      <div class="modal-title">✏️ 修改班級名稱</div>
+      <button class="modal-close" onclick="closeModal()">×</button>
+    </div>
+    <div class="form-group">
+      <label class="form-label">班級名稱</label>
+      <input type="text" id="className" class="form-input" value="${escapeAttr(c.name)}" autofocus>
+    </div>
+    <div class="row-end">
+      <button class="btn btn-ghost" onclick="closeModal()">取消</button>
+      <button class="btn btn-primary" onclick="confirmEditClass('${cid}')">儲存</button>
+    </div>
+  `);
+  setTimeout(() => document.getElementById('className')?.focus(), 100);
+}
+
+function confirmEditClass(cid) {
+  const c = state.classes.find(x => x.id === cid);
+  if (!c) return;
+  const name = document.getElementById('className').value.trim();
+  if (!name) { toast('請輸入班級名稱', 'error'); return; }
+  if (state.classes.some(x => x.id !== cid && x.name === name)) {
+    toast('已有同名班級', 'error');
+    return;
+  }
+  c.name = name;
+  saveState();
+  closeModal();
+  setView('classes');
+  toast('已更新 ✓', 'success');
+}
+
+function deleteClass(cid) {
+  const c = state.classes.find(x => x.id === cid);
+  if (!c) return;
+  const studentCount = state.students.filter(s => s.classId === cid).length;
+  if (studentCount > 0) {
+    toast(`「${c.name}」仲有 ${studentCount} 位學生，請先將學生移到其他班`, 'error');
+    return;
+  }
+  if (!confirm(`確定刪除班級「${c.name}」？`)) return;
+  state.classes = state.classes.filter(x => x.id !== cid);
+  saveState();
+  setView('classes');
+  toast('已刪除', 'success');
+}
+
+/* ================================================
+   7c. EXCEL 匯入學生
+   ================================================ */
+function importStudentsExcel() {
+  if (state.classes.length === 0) {
+    toast('請先建立至少一個班級', 'error');
+    setView('classes');
+    return;
+  }
+  openModal(`
+    <div class="modal-header">
+      <div class="modal-title">📥 匯入學生（EXCEL）</div>
+      <button class="modal-close" onclick="closeModal()">×</button>
+    </div>
+    <div class="form-group">
+      <label class="form-label">選擇 .xlsx 檔案</label>
+      <input type="file" id="excelFile" accept=".xlsx,.xls" class="form-input">
+      <div class="form-hint">
+        格式：第 1 行是標題，之後每行一位學生<br>
+        欄位順序：<b>班級</b>、<b>學號</b>、<b>姓名</b><br>
+        例如：3A 01 小明
+      </div>
+    </div>
+    <div class="form-group">
+      <label class="form-label">預覽</label>
+      <div id="excelPreview" class="text-muted text-sm" style="max-height: 200px; overflow: auto; background: #f9fafb; padding: 8px; border-radius: 6px;">
+        揀咗檔案之後會顯示預覽
+      </div>
+    </div>
+    <div class="row-end">
+      <button class="btn btn-ghost" onclick="closeModal()">取消</button>
+      <button class="btn btn-primary" id="confirmImportBtn" onclick="confirmImportExcel()" disabled>📥 匯入</button>
+    </div>
+  `);
+  setTimeout(() => {
+    const fileInput = document.getElementById('excelFile');
+    if (fileInput) {
+      fileInput.addEventListener('change', handleExcelFile);
+    }
+  }, 100);
+}
+
+let _importedStudents = null; // { rows: [...], newClasses: [...] }
+
+function handleExcelFile(ev) {
+  const file = ev.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    try {
+      const data = new Uint8Array(e.target.result);
+      const wb = XLSX.read(data, { type: 'array' });
+      const sheet = wb.Sheets[wb.SheetNames[0]];
+      const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' });
+      // 過濾空行 + skip header
+      const dataRows = rows.filter(r => r.some(c => String(c).trim()));
+      if (dataRows.length === 0) {
+        document.getElementById('excelPreview').textContent = '❌ 檔案冇內容';
+        return;
+      }
+      // 偵測第一行係咪 header（有中文字就當 header）
+      const firstRow = dataRows[0].map(c => String(c).trim());
+      const isHeader = firstRow.some(c => /[\u4e00-\u9fff]/.test(c) && /班|級|學|號|名|Name|Class/.test(c));
+      const bodyRows = isHeader ? dataRows.slice(1) : dataRows;
+
+      // 自動偵測欄位（搜尋「班級」「學號」「姓名」等關鍵字，否則用 column 0/1/2）
+      let cols = { class: 0, number: 1, name: 2 };
+      if (isHeader) {
+        firstRow.forEach((cell, idx) => {
+          if (/班|級|Class/i.test(cell)) cols.class = idx;
+          else if (/學號|號|Number|No/i.test(cell)) cols.number = idx;
+          else if (/姓|名|Name/i.test(cell)) cols.name = idx;
+        });
+      }
+
+      // 收集需要建立嘅新班級
+      const newClasses = [];
+      const parsed = bodyRows.map(r => {
+        const className = String(r[cols.class] || '').trim();
+        const number = String(r[cols.number] || '').trim();
+        const name = String(r[cols.name] || '').trim();
+        if (!name) return null;
+        if (className && !state.classes.some(c => c.name === className) && !newClasses.some(c => c.name === className)) {
+          newClasses.push({ name: className });
+        }
+        return { className, number, name };
+      }).filter(Boolean);
+
+      _importedStudents = { rows: parsed, newClasses };
+
+      // 預覽
+      const preview = parsed.slice(0, 10).map(r =>
+        `<div>${escapeHtml(r.className || '—')} · #${escapeHtml(r.number || '?')} · <b>${escapeHtml(r.name)}</b></div>`
+      ).join('');
+      const more = parsed.length > 10 ? `<div class="text-muted">… 仲有 ${parsed.length - 10} 位</div>` : '';
+      const newClsInfo = newClasses.length > 0
+        ? `<div style="color: var(--c-success); margin-top: 8px;">✓ 會自動建立 ${newClasses.length} 個新班級：${newClasses.map(c => escapeHtml(c.name)).join('、')}</div>`
+        : '';
+      document.getElementById('excelPreview').innerHTML =
+        `<div class="text-muted">偵測到 <b>${parsed.length}</b> 位學生${isHeader ? '（已跳過標題行）' : ''}</div>` +
+        preview + more + newClsInfo;
+      document.getElementById('confirmImportBtn').disabled = false;
+    } catch (e) {
+      console.error(e);
+      document.getElementById('excelPreview').textContent = '❌ 讀取失敗：' + e.message;
+    }
+  };
+  reader.readAsArrayBuffer(file);
+}
+
+function confirmImportExcel() {
+  if (!_importedStudents || _importedStudents.rows.length === 0) {
+    toast('冇可匯入嘅學生', 'error');
+    return;
+  }
+  // 建立新班級
+  const clsMap = {}; // name -> id
+  state.classes.forEach(c => clsMap[c.name] = c.id);
+  _importedStudents.newClasses.forEach(nc => {
+    const id = uid('cls');
+    state.classes.push({ id, name: nc.name, createdAt: Date.now() });
+    clsMap[nc.name] = id;
+  });
+  // 加入學生
+  let nextNum = state.students.length + 1;
+  let added = 0;
+  _importedStudents.rows.forEach(r => {
+    const cid = r.className ? clsMap[r.className] : (state.classes[0]?.id || null);
+    state.students.push({
+      id: uid('s'),
+      name: r.name,
+      classId: cid,
+      number: nextNum++,
+      createdAt: Date.now(),
+    });
+    added++;
+  });
+  saveState();
+  closeModal();
+  setView('students');
+  toast(`已匯入 ${added} 位學生${_importedStudents.newClasses.length > 0 ? `、新建 ${_importedStudents.newClasses.length} 個班級` : ''} ✓`, 'success');
+  _importedStudents = null;
 }
 window.newQuiz = newQuiz;
 window.confirmNewQuiz = confirmNewQuiz;
@@ -853,6 +1234,13 @@ window.confirmEditStudent = confirmEditStudent;
 window.deleteStudent = deleteStudent;
 window.bulkAddStudents = bulkAddStudents;
 window.confirmBulkAdd = confirmBulkAdd;
+window.newClass = newClass;
+window.confirmNewClass = confirmNewClass;
+window.editClass = editClass;
+window.confirmEditClass = confirmEditClass;
+window.deleteClass = deleteClass;
+window.importStudentsExcel = importStudentsExcel;
+window.confirmImportExcel = confirmImportExcel;
 
 /* ================================================
    8. Live Mode
@@ -867,10 +1255,11 @@ let liveState = {
   revealed: null,  // 當前揭曉的題目 id
 };
 
-function startLive(quizId) {
+function startLive(quizId, classId = 'all') {
   state.currentSession = {
     id: uid('sess'),
     quizId,
+    classId,  // 記住係邊個班答嘅
     startedAt: Date.now(),
     answers: {},
   };
@@ -880,9 +1269,11 @@ function startLive(quizId) {
 
 function startLiveSession() {
   const sel = document.getElementById('liveQuizSelect');
+  const classSel = document.getElementById('liveClassSelect');
   const modeRadio = document.querySelector('input[name="liveMode"]:checked');
   if (!sel) return;
-  startLive(sel.value);
+  const classId = classSel ? classSel.value : 'all';
+  startLive(sel.value, classId);
   if (modeRadio) liveState.mode = modeRadio.value;
 }
 window.startLive = startLive;
@@ -894,6 +1285,15 @@ function renderLiveStage() {
   const quiz = state.quizzes.find(q => q.id === session.quizId);
   if (!quiz) return '<div class="empty">題目不存在</div>';
 
+  // 班級範圍
+  const classId = session.classId || 'all';
+  const sessionStudents = (classId === 'all' || !classId)
+    ? state.students
+    : state.students.filter(s => s.classId === classId);
+  const sessionClassName = classId === 'all'
+    ? '全部班級'
+    : className(classId);
+
   const q = quiz.questions[liveState.currentQIdx];
   if (!q) {
     // 完成所有題目
@@ -902,15 +1302,15 @@ function renderLiveStage() {
   }
 
   const isTf = q.type === 'tf';
-  const answered = Object.keys(session.answers).filter(sid => session.answers[sid][q.id]).length;
-  const total = state.students.length;
+  const answered = sessionStudents.filter(s => session.answers[s.id]?.[q.id]).length;
+  const total = sessionStudents.length;
   const isLast = liveState.currentQIdx === quiz.questions.length - 1;
 
-  // 計算各選項人數
+  // 計算各選項人數（只計範圍內學生）
   const counts = isTf
     ? { T: 0, F: 0, '': 0 }
     : { A: 0, B: 0, C: 0, D: 0, '': 0 };
-  state.students.forEach(s => {
+  sessionStudents.forEach(s => {
     const ans = session.answers[s.id]?.[q.id];
     if (ans) counts[ans] = (counts[ans] || 0) + 1;
     else counts['']++;
@@ -946,7 +1346,7 @@ function renderLiveStage() {
   return `
     <div class="row-between mb-2 no-print">
       <div>
-        <h2 class="view-title">▶️ ${escapeHtml(quiz.title)}</h2>
+        <h2 class="view-title">▶️ ${escapeHtml(quiz.title)} · <span class="text-muted text-sm" style="font-size: 18px;">${escapeHtml(sessionClassName)}</span></h2>
         <p class="view-subtitle">題目 ${liveState.currentQIdx + 1} / ${quiz.questions.length} · ${isTf ? '✓/✗ 二選一' : 'A/B/C/D 四選一'} · 模式：${liveState.mode === 'scan' ? '📷 掃描' : '🖱️ 手動'}</p>
       </div>
       <div class="row">
@@ -1004,19 +1404,23 @@ function renderScannerSection() {
 
 function renderManualSection() {
   // 手動模式：每位學生按鈕組
-  if (state.students.length === 0) {
-    return `<div class="card mt-2"><div class="empty"><div class="empty-icon">👨‍🎓</div><div class="empty-title">沒有學生</div></div></div>`;
-  }
   const session = state.currentSession;
+  const classId = session.classId || 'all';
+  const sessionStudents = (classId === 'all' || !classId)
+    ? state.students
+    : state.students.filter(s => s.classId === classId);
+  if (sessionStudents.length === 0) {
+    return `<div class="card mt-2"><div class="empty"><div class="empty-icon">👨‍🎓</div><div class="empty-title">冇學生</div></div></div>`;
+  }
   const quiz = state.quizzes.find(q => q.id === session.quizId);
   const q = quiz.questions[liveState.currentQIdx];
   const isTf = q.type === 'tf';
   const opts = isTf ? ['T', 'F'] : ['A', 'B', 'C', 'D'];
   return `
     <div class="card mt-2 no-print">
-      <div class="card-title mb-2">👨‍🎓 點選學生答案（${isTf ? '✓/✗' : 'A/B/C/D'}）</div>
+      <div class="card-title mb-2">👨‍🎓 點選學生答案（${isTf ? '✓/✗' : 'A/B/C/D'} · ${sessionStudents.length} 位）</div>
       <div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 10px;">
-        ${state.students.map(s => {
+        ${sessionStudents.map(s => {
           const ans = session.answers[s.id]?.[q.id];
           return `
             <div style="display: flex; align-items: center; gap: 8px; padding: 8px; background: #fafbff; border-radius: 8px;">
@@ -1299,6 +1703,11 @@ function handleScannedQR(data) {
     return;
   }
 
+  // 檢查跨班作答（warning 但仍記錄）
+  if (session.classId && session.classId !== 'all' && student.classId && student.classId !== session.classId) {
+    console.warn(`[cross-class] ${student.name} (${className(student.classId)}) 答咗 ${className(session.classId)} 嘅題目`);
+  }
+
   // 記錄答案
   if (!session.answers[sid]) session.answers[sid] = {};
   session.answers[sid][q.id] = answer;
@@ -1395,8 +1804,15 @@ function viewSessionDetail(sid) {
   const quiz = state.quizzes.find(q => q.id === session.quizId);
   if (!quiz) { toast('題目已被刪除', 'error'); return; }
 
+  // 班級範圍
+  const clsId = session.classId || 'all';
+  const sessStudents = (clsId === 'all' || !clsId)
+    ? state.students
+    : state.students.filter(s => s.classId === clsId);
+  const sessClassName = clsId === 'all' ? '全部' : className(clsId);
+
   // 計算每位學生成績 + 逐題答案
-  const results = state.students.map(s => {
+  const results = sessStudents.map(s => {
     const perQuestion = quiz.questions.map(q => {
       const ans = session.answers[s.id]?.[q.id] || '';
       const isCorrect = ans && ans === q.correct;
@@ -1410,20 +1826,20 @@ function viewSessionDetail(sid) {
   // 整體正確率
   const totalAnswered = results.reduce((sum, r) => sum + r.answered, 0);
   const totalCorrect = results.reduce((sum, r) => sum + r.correct, 0);
-  const totalPossible = state.students.length * quiz.questions.length;
+  const totalPossible = sessStudents.length * quiz.questions.length;
   const accuracy = totalPossible > 0 ? Math.round((totalCorrect / totalPossible) * 100) : 0;
-  const participation = state.students.length > 0 ? Math.round((results.filter(r => r.answered > 0).length / state.students.length) * 100) : 0;
+  const participation = sessStudents.length > 0 ? Math.round((results.filter(r => r.answered > 0).length / sessStudents.length) * 100) : 0;
 
   // 各題正確率 + 選項分佈
   const qStats = quiz.questions.map((q, i) => {
-    const answeredCount = state.students.filter(s => session.answers[s.id]?.[q.id]).length;
-    const correctCount = state.students.filter(s => session.answers[s.id]?.[q.id] === q.correct).length;
+    const answeredCount = sessStudents.filter(s => session.answers[s.id]?.[q.id]).length;
+    const correctCount = sessStudents.filter(s => session.answers[s.id]?.[q.id] === q.correct).length;
     const rate = answeredCount > 0 ? Math.round((correctCount / answeredCount) * 100) : 0;
     // 各選項人數
     const isTf = q.type === 'tf';
     const optIds = isTf ? ['T', 'F'] : ['A', 'B', 'C', 'D'];
     const optDist = optIds.map(opt => {
-      const count = state.students.filter(s => session.answers[s.id]?.[q.id] === opt).length;
+      const count = sessStudents.filter(s => session.answers[s.id]?.[q.id] === opt).length;
       return { opt, count };
     });
     return { q, idx: i, answeredCount, correctCount, rate, optDist, isTf };
@@ -1470,7 +1886,7 @@ function viewSessionDetail(sid) {
     return `
       <tr>
         <td><b>Q${s.idx + 1}</b> ${escapeHtml(s.q.text.slice(0, 30))}${s.q.text.length > 30 ? '…' : ''}</td>
-        <td>${s.answeredCount}/${state.students.length}</td>
+        <td>${s.answeredCount}/${sessStudents.length}</td>
         <td><b style="color: var(--c-success);">${s.correctCount}</b></td>
         <td><b>${s.rate}%</b></td>
         ${distCells}
@@ -1480,12 +1896,12 @@ function viewSessionDetail(sid) {
 
   openModal(`
     <div class="modal-header">
-      <div class="modal-title">📊 ${escapeHtml(quiz.title)} — 詳細報告</div>
+      <div class="modal-title">📊 ${escapeHtml(quiz.title)} · ${escapeHtml(sessClassName)} — 詳細報告</div>
       <button class="modal-close" onclick="closeModal()">×</button>
     </div>
 
     <div class="stats-grid" style="margin-bottom: 16px;">
-      <div class="stat-card"><div class="stat-num">${state.students.length}</div><div class="stat-label">全班人數</div></div>
+      <div class="stat-card"><div class="stat-num">${sessStudents.length}</div><div class="stat-label">參與人數</div></div>
       <div class="stat-card"><div class="stat-num">${participation}%</div><div class="stat-label">參與率</div></div>
       <div class="stat-card"><div class="stat-num">${totalCorrect}/${totalPossible}</div><div class="stat-label">答對/總題數</div></div>
       <div class="stat-card"><div class="stat-num" style="color: var(--c-success);">${accuracy}%</div><div class="stat-label">整體正確率</div></div>
@@ -1563,6 +1979,13 @@ function exportSession(sid) {
   const quiz = state.quizzes.find(q => q.id === session.quizId);
   if (!quiz) { toast('題目已被刪除', 'error'); return; }
 
+  // 班級範圍
+  const clsId = session.classId || 'all';
+  const sessStudents = (clsId === 'all' || !clsId)
+    ? state.students
+    : state.students.filter(s => s.classId === clsId);
+  const sessClassName = clsId === 'all' ? '全部' : className(clsId);
+
   // 將答案 ID 轉成用戶友善的顯示（T → ✓, F → ✗）
   const ansLabel = (q, ans) => {
     if (!ans) return '';
@@ -1575,9 +1998,9 @@ function exportSession(sid) {
     return q.correct;
   };
 
-  const header = ['姓名', '編號', ...quiz.questions.map((q, i) => `Q${i + 1}${q.type === 'tf' ? '(✓/✗)' : ''}`), '答對', '正確率'];
-  const rows = state.students.map(s => {
-    const cells = [s.name, s.number];
+  const header = ['姓名', '編號', '班級', ...quiz.questions.map((q, i) => `Q${i + 1}${q.type === 'tf' ? '(✓/✗)' : ''}`), '答對', '正確率'];
+  const rows = sessStudents.map(s => {
+    const cells = [s.name, s.number, className(s.classId)];
     let correct = 0;
     quiz.questions.forEach(q => {
       const ans = session.answers[s.id]?.[q.id] || '';
@@ -1597,7 +2020,7 @@ function exportSession(sid) {
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
-  a.download = `${quiz.title}-${formatDate(session.startedAt)}.csv`;
+  a.download = `${quiz.title}-${sessClassName}-${formatDate(session.startedAt)}.csv`;
   a.click();
   URL.revokeObjectURL(url);
   toast('CSV 已下載 ✓', 'success');
@@ -1885,6 +2308,13 @@ function exportSessionExcel(sid) {
   if (!quiz) { toast('題目已被刪除', 'error'); return; }
   if (!window.XLSX) { toast('EXCEL 庫未載入', 'error'); return; }
 
+  // 班級範圍
+  const clsId = session.classId || 'all';
+  const sessStudents = (clsId === 'all' || !clsId)
+    ? state.students
+    : state.students.filter(s => s.classId === clsId);
+  const sessClassName = clsId === 'all' ? '全部' : className(clsId);
+
   const ansLabel = (q, ans) => {
     if (!ans) return '';
     if (q.type === 'tf') return ans === 'T' ? '✓對' : '✗錯';
@@ -1897,20 +2327,21 @@ function exportSessionExcel(sid) {
   };
 
   // Sheet 1: 總覽
-  let totalCorrect = 0, totalAnswered = 0, totalPossible = state.students.length * quiz.questions.length;
+  let totalCorrect = 0, totalAnswered = 0, totalPossible = sessStudents.length * quiz.questions.length;
   const summary = [
     ['答題報告'],
     ['測驗名稱', quiz.title],
+    ['班級', sessClassName],
     ['開始時間', formatDate(session.startedAt)],
     ['結束時間', session.finishedAt ? formatDate(session.finishedAt) : '進行中'],
-    ['班級人數', state.students.length],
+    ['班級人數', sessStudents.length],
     ['題目數量', quiz.questions.length],
     ['總作答數', ''],
     ['總答對數', ''],
     ['總題數', totalPossible],
     ['整體正確率', ''],
   ];
-  state.students.forEach(stu => {
+  sessStudents.forEach(stu => {
     quiz.questions.forEach(q => {
       const ans = session.answers[stu.id]?.[q.id];
       if (ans) {
@@ -1919,14 +2350,14 @@ function exportSessionExcel(sid) {
       }
     });
   });
-  summary[6][1] = totalAnswered;
-  summary[7][1] = totalCorrect;
-  summary[9][1] = totalPossible > 0 ? Math.round((totalCorrect / totalPossible) * 100) + '%' : '0%';
+  summary[7][1] = totalAnswered;
+  summary[8][1] = totalCorrect;
+  summary[10][1] = totalPossible > 0 ? Math.round((totalCorrect / totalPossible) * 100) + '%' : '0%';
 
   // Sheet 2: 學生詳細
-  const studentHeader = ['姓名', '編號', '作答數', '答對數', '正確率', ...quiz.questions.map((_, i) => `Q${i + 1} (${quiz.questions[i].type === 'tf' ? '✓/✗' : 'A/B/C/D'})`)];
-  const studentRows = state.students.map(stu => {
-    const cells = [stu.name, stu.number];
+  const studentHeader = ['姓名', '編號', '班級', '作答數', '答對數', '正確率', ...quiz.questions.map((_, i) => `Q${i + 1} (${quiz.questions[i].type === 'tf' ? '✓/✗' : 'A/B/C/D'})`)];
+  const studentRows = sessStudents.map(stu => {
+    const cells = [stu.name, stu.number, className(stu.classId)];
     let correct = 0, answered = 0;
     const answers = quiz.questions.map(q => {
       const ans = session.answers[stu.id]?.[q.id] || '';
@@ -1941,8 +2372,8 @@ function exportSessionExcel(sid) {
   const qHeader = ['題目', '題型', '正確答案', '選項A', '選項B', '選項C', '選項D', '作答人數', '答對人數', '正確率'];
   const qRows = quiz.questions.map((q, i) => {
     const ansAB = q.options.map(o => o.text);
-    const answeredCount = state.students.filter(s => session.answers[s.id]?.[q.id]).length;
-    const correctCount = state.students.filter(s => session.answers[s.id]?.[q.id] === q.correct).length;
+    const answeredCount = sessStudents.filter(s => session.answers[s.id]?.[q.id]).length;
+    const correctCount = sessStudents.filter(s => session.answers[s.id]?.[q.id] === q.correct).length;
     const rate = answeredCount > 0 ? Math.round((correctCount / answeredCount) * 100) : 0;
     return [
       `Q${i + 1}: ${q.text}`,
@@ -1959,15 +2390,15 @@ function exportSessionExcel(sid) {
   });
 
   // Sheet 4: 原始答案
-  const rawHeader = ['學生', '編號', ...quiz.questions.map((_, i) => `Q${i + 1}`)];
-  const rawRows = state.students.map(stu => {
-    const cells = [stu.name, stu.number];
+  const rawHeader = ['學生', '編號', '班級', ...quiz.questions.map((_, i) => `Q${i + 1}`)];
+  const rawRows = sessStudents.map(stu => {
+    const cells = [stu.name, stu.number, className(stu.classId)];
     quiz.questions.forEach(q => {
       cells.push(ansLabel(q, session.answers[stu.id]?.[q.id] || ''));
     });
     return cells;
   });
-  const correctRow = ['正確答案', '', ...quiz.questions.map(q => correctLabel(q))];
+  const correctRow = ['正確答案', '', '', ...quiz.questions.map(q => correctLabel(q))];
 
   // 用 SheetJS 生成 xlsx
   const wb = XLSX.utils.book_new();
@@ -1980,7 +2411,7 @@ function exportSessionExcel(sid) {
   XLSX.utils.book_append_sheet(wb, ws3, '題目分析');
   XLSX.utils.book_append_sheet(wb, ws4, '原始答案');
 
-  const filename = `ClassView-報告-${quiz.title}-${formatDate(session.startedAt).replace(/[/: ]/g, '-')}.xlsx`;
+  const filename = `ClassView-報告-${quiz.title}-${sessClassName}-${formatDate(session.startedAt).replace(/[/: ]/g, '-')}.xlsx`;
   XLSX.writeFile(wb, filename);
   toast(`✓ EXCEL 已下載：${filename}`, 'success');
 }
@@ -1995,6 +2426,13 @@ async function exportSessionPDF(sid) {
   if (!quiz) { toast('題目已被刪除', 'error'); return; }
   if (!window.html2canvas || !window.jspdf) { toast('PDF 庫未載入', 'error'); return; }
 
+  // 班級範圍
+  const clsId = session.classId || 'all';
+  const sessStudents = (clsId === 'all' || !clsId)
+    ? state.students
+    : state.students.filter(s => s.classId === clsId);
+  const sessClassName = clsId === 'all' ? '全部' : className(clsId);
+
   toast('生成 PDF 報告中…', 'success');
 
   // 計算資料
@@ -2005,7 +2443,7 @@ async function exportSessionPDF(sid) {
   };
   const correctLabel = (q) => q.type === 'tf' ? (q.correct === 'T' ? '✓' : '✗') : q.correct;
 
-  const results = state.students.map(s => {
+  const results = sessStudents.map(s => {
     const perQ = quiz.questions.map(q => {
       const ans = session.answers[s.id]?.[q.id] || '';
       return { q, ans, isCorrect: ans && ans === q.correct };
@@ -2017,9 +2455,9 @@ async function exportSessionPDF(sid) {
 
   const totalCorrect = results.reduce((s, r) => s + r.correct, 0);
   const totalAnswered = results.reduce((s, r) => s + r.answered, 0);
-  const totalPossible = state.students.length * quiz.questions.length;
+  const totalPossible = sessStudents.length * quiz.questions.length;
   const accuracy = totalPossible > 0 ? Math.round((totalCorrect / totalPossible) * 100) : 0;
-  const participation = state.students.length > 0 ? Math.round((results.filter(r => r.answered > 0).length / state.students.length) * 100) : 0;
+  const participation = sessStudents.length > 0 ? Math.round((results.filter(r => r.answered > 0).length / sessStudents.length) * 100) : 0;
 
   // 建立隱藏容器渲染報告
   const container = document.createElement('div');
@@ -2041,7 +2479,7 @@ async function exportSessionPDF(sid) {
   const titleSection = `
     <div style="padding: 20px 16px 8px; text-align: center;">
       <div style="font-size: 32px; font-weight: 900; color: #1e40af; margin-bottom: 4px;">📊 答題報告</div>
-      <div style="font-size: 18px; color: #555;">${escapeHtml(quiz.title)}</div>
+      <div style="font-size: 18px; color: #555;">${escapeHtml(quiz.title)} · ${escapeHtml(sessClassName)}</div>
       <div style="font-size: 12px; color: #888; margin-top: 4px;">${formatDate(session.startedAt)}${session.finishedAt ? ' ~ ' + formatDate(session.finishedAt) : ''}</div>
     </div>
   `;
@@ -2052,8 +2490,8 @@ async function exportSessionPDF(sid) {
       <div style="font-size: 18px; font-weight: 800; color: #1e40af; margin-bottom: 8px; border-bottom: 2px solid #1e40af; padding-bottom: 4px;">📈 整體概覽</div>
       <div style="display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 8px; margin-bottom: 8px;">
         <div style="padding: 10px; background: #eff6ff; border-radius: 6px; text-align: center;">
-          <div style="font-size: 24px; font-weight: 800; color: #2563eb;">${state.students.length}</div>
-          <div style="font-size: 11px; color: #555;">班級人數</div>
+          <div style="font-size: 24px; font-weight: 800; color: #2563eb;">${sessStudents.length}</div>
+          <div style="font-size: 11px; color: #555;">參與人數</div>
         </div>
         <div style="padding: 10px; background: #fef3c7; border-radius: 6px; text-align: center;">
           <div style="font-size: 24px; font-weight: 800; color: #d97706;">${participation}%</div>
