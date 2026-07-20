@@ -495,7 +495,18 @@ views.home = () => `
 
 /* ---------- Quizzes (List + Edit) ---------- */
 views.quizzes = () => {
-  const quizList = myQuizzes().map(q => `
+  const allQuizzes = myQuizzes();
+  const folders = myFolders();
+  // 按 folder 分組
+  const grouped = { unfiled: [] };
+  folders.forEach(f => { grouped[f.id] = []; });
+  allQuizzes.forEach(q => {
+    const fid = q.folderId || 'unfiled';
+    if (!grouped[fid]) grouped[fid] = [];
+    grouped[fid].push(q);
+  });
+
+  const renderQuizCard = (q) => `
     <div class="card">
       <div class="row-between">
         <div>
@@ -509,19 +520,40 @@ views.quizzes = () => {
         </div>
       </div>
     </div>
-  `).join('');
+  `;
+
+  const folderSections = folders.map(f => {
+    const qs = grouped[f.id] || [];
+    if (qs.length === 0) return '';
+    return `
+      <div class="mb-2">
+        <h3 class="folder-header">📁 ${escapeHtml(f.name)} <span class="text-muted text-sm">（${qs.length}）</span></h3>
+        ${qs.map(renderQuizCard).join('')}
+      </div>
+    `;
+  }).join('');
+
+  const unfiledSection = (grouped.unfiled && grouped.unfiled.length > 0)
+    ? `<div class="mb-2">
+        <h3 class="folder-header">📂 未分類 <span class="text-muted text-sm">（${grouped.unfiled.length}）</span></h3>
+        ${grouped.unfiled.map(renderQuizCard).join('')}
+      </div>`
+    : '';
 
   return `
     <div class="row-between mb-2">
       <div>
         <h2 class="view-title">📝 題目庫</h2>
-        <p class="view-subtitle">建立選擇題，每題 4 個選項（A / B / C / D）</p>
+        <p class="view-subtitle">建立選擇題 · 可用資料夾分類</p>
       </div>
-      <button class="btn btn-primary btn-lg" onclick="newQuiz()">➕ 新增題目</button>
+      <div class="row">
+        <button class="btn btn-ghost" onclick="manageFolders()">📁 資料夾</button>
+        <button class="btn btn-primary btn-lg" onclick="newQuiz()">➕ 新增題目</button>
+      </div>
     </div>
-    ${myQuizzes().length === 0
+    ${allQuizzes.length === 0
       ? `<div class="empty"><div class="empty-icon">📝</div><div class="empty-title">還沒有題目</div><p>點「新增題目」開始建立</p></div>`
-      : quizList
+      : folderSections + unfiledSection
     }
   `;
 };
@@ -845,6 +877,7 @@ views.results = () => {
    6. Quiz CRUD
    ================================================ */
 function newQuiz() {
+  const folders = myFolders();
   openModal(`
     <div class="modal-header">
       <div class="modal-title">➕ 新增題目</div>
@@ -855,6 +888,15 @@ function newQuiz() {
       <input type="text" id="quizTitle" class="form-input" placeholder="例：一年級數學測驗" autofocus>
       <div class="form-hint">之後可以加入多條題目</div>
     </div>
+    ${folders.length > 0 ? `
+    <div class="form-group">
+      <label class="form-label">分類（選填）</label>
+      <select id="quizFolder" class="form-select">
+        <option value="">未分類</option>
+        ${folders.map(f => `<option value="${f.id}">📁 ${escapeHtml(f.name)}</option>`).join('')}
+      </select>
+    </div>
+    ` : ''}
     <div class="row-end">
       <button class="btn btn-ghost" onclick="closeModal()">取消</button>
       <button class="btn btn-primary" onclick="confirmNewQuiz()">建立並加入題目 →</button>
@@ -866,11 +908,12 @@ function newQuiz() {
 function confirmNewQuiz() {
   const title = document.getElementById('quizTitle').value.trim();
   if (!title) { toast('請輸入題目名稱', 'error'); return; }
+  const folderId = document.getElementById('quizFolder')?.value || null;
   const quiz = {
     id: uid('q'),
     ownerId: currentUser()?.id || null,
     title,
-    folderId: null,
+    folderId: folderId,
     questions: [createEmptyQuestion()],
     createdAt: Date.now(),
   };
@@ -1355,6 +1398,115 @@ function deleteClass(cid) {
   saveState();
   setView('classes');
   toast('已刪除', 'success');
+}
+
+/* ================================================
+   7d. Folder CRUD (題目分類)
+   ================================================ */
+function manageFolders() {
+  const folders = myFolders();
+  const list = folders.length === 0
+    ? `<div class="empty"><div class="empty-icon">📁</div><div class="empty-title">還沒有資料夾</div></div>`
+    : folders.map(f => {
+        const qCount = myQuizzes().filter(q => q.folderId === f.id).length;
+        return `
+          <div class="row-between" style="padding: 12px 0; border-bottom: 1px solid #e5e7eb;">
+            <div>
+              <div style="font-weight: 700; font-size: 16px;">📁 ${escapeHtml(f.name)}</div>
+              <div class="text-muted text-sm">${qCount} 份題目</div>
+            </div>
+            <div class="row" style="gap: 6px;">
+              <button class="btn btn-ghost btn-sm" onclick="closeModal(); renameFolder('${f.id}')">✏️ 改名</button>
+              <button class="btn btn-danger btn-sm" onclick="deleteFolder('${f.id}')">🗑️</button>
+            </div>
+          </div>
+        `;
+      }).join('');
+  openModal(`
+    <div class="modal-header">
+      <div class="modal-title">📁 資料夾管理</div>
+      <button class="modal-close" onclick="closeModal()">×</button>
+    </div>
+    <div class="form-group">
+      <div class="row">
+        <input type="text" id="newFolderName" class="form-input" placeholder="新資料夾名稱（例如：數學、常識、評估）" style="flex: 1;">
+        <button class="btn btn-primary" onclick="confirmNewFolder()">➕ 新增</button>
+      </div>
+    </div>
+    <div class="form-label">已有資料夾</div>
+    ${list}
+    <div class="form-hint mt-2">刪除資料夾後，入面嘅題目會自動變成「未分類」</div>
+  `);
+}
+
+function confirmNewFolder() {
+  const name = document.getElementById('newFolderName').value.trim();
+  if (!name) { toast('請輸入資料夾名稱', 'error'); return; }
+  if (myFolders().some(f => f.name === name)) {
+    toast('已有同名資料夾', 'error');
+    return;
+  }
+  const folder = {
+    id: uid('f'),
+    ownerId: currentUser()?.id || null,
+    name,
+    createdAt: Date.now(),
+  };
+  state.folders.push(folder);
+  saveState();
+  closeModal();
+  toast(`已建立資料夾「${name}」 ✓`, 'success');
+  // 如果用戶喺題目庫，重新 render
+  if (currentView === 'quizzes') setView('quizzes');
+}
+
+function renameFolder(fid) {
+  const f = myFolders().find(x => x.id === fid);
+  if (!f) return;
+  openModal(`
+    <div class="modal-header">
+      <div class="modal-title">✏️ 修改資料夾名稱</div>
+      <button class="modal-close" onclick="closeModal()">×</button>
+    </div>
+    <div class="form-group">
+      <label class="form-label">資料夾名稱</label>
+      <input type="text" id="folderName" class="form-input" value="${escapeAttr(f.name)}" autofocus>
+    </div>
+    <div class="row-end">
+      <button class="btn btn-ghost" onclick="closeModal()">取消</button>
+      <button class="btn btn-primary" onclick="confirmRenameFolder('${fid}')">儲存</button>
+    </div>
+  `);
+  setTimeout(() => document.getElementById('folderName')?.focus(), 100);
+}
+
+function confirmRenameFolder(fid) {
+  const f = myFolders().find(x => x.id === fid);
+  if (!f) return;
+  const name = document.getElementById('folderName').value.trim();
+  if (!name) { toast('請輸入資料夾名稱', 'error'); return; }
+  if (myFolders().some(x => x.id !== fid && x.name === name)) {
+    toast('已有同名資料夾', 'error');
+    return;
+  }
+  f.name = name;
+  saveState();
+  closeModal();
+  toast('已更新 ✓', 'success');
+  if (currentView === 'quizzes') setView('quizzes');
+}
+
+function deleteFolder(fid) {
+  const f = myFolders().find(x => x.id === fid);
+  if (!f) return;
+  if (!confirm(`確定刪除資料夾「${f.name}」？\n入面嘅 ${myQuizzes().filter(q => q.folderId === fid).length} 份題目會變成「未分類」。`)) return;
+  // 將入面嘅題目 folderId 設返 null
+  state.quizzes.forEach(q => { if (q.folderId === fid) q.folderId = null; });
+  state.folders = state.folders.filter(x => x.id !== fid);
+  saveState();
+  closeModal();
+  toast('已刪除', 'success');
+  if (currentView === 'quizzes') setView('quizzes');
 }
 
 /* ================================================
