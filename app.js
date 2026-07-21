@@ -437,15 +437,20 @@ function showUserMenu() {
       </div>
     </div>
     <div class="form-group mt-2" style="border-top: 1px solid #e5e7eb; padding-top: 12px;">
-      <div class="text-muted text-sm">☁️ 雲端同步（Supabase）</div>
+      <div class="text-muted text-sm">☁️ 雲端同步（GitHub Gist）</div>
       <div class="form-hint mb-2">
-        ${isCloudConfigured() ? '✓ 已設定：' + escapeHtml(getCloudConfig().url) : '⚠️ 未設定'}
+        ${isCloudConfigured()
+          ? (getCloudConfig().gistId
+              ? '✓ 已綁定 Gist ' + escapeHtml(getCloudConfig().gistId.slice(0, 8)) + '…'
+              : '⚠️ 已設定 PAT，下次上傳會建立 Gist')
+          : '⚠️ 未設定（撳「⚙️ 設定」輸入 GitHub PAT）'}
       </div>
       <div class="row" style="gap: 6px; flex-wrap: wrap;">
-        <button class="btn btn-ghost btn-sm" onclick="closeModal(); pushToCloud();">⬆️ 上傳到雲端</button>
+        <button class="btn btn-ghost btn-sm" onclick="closeModal(); pushToCloud();">⬆️ 上傳</button>
         <button class="btn btn-primary btn-sm" onclick="closeModal(); pullFromCloud();">⬇️ 從雲端還原</button>
-        <button class="btn btn-ghost btn-sm" onclick="closeModal(); pushToCloud();">⚙️ 設定</button>
+        <button class="btn btn-ghost btn-sm" onclick="closeModal(); openCloudSettings();">⚙️ 設定</button>
       </div>
+      <div class="form-hint mt-2">最簡單嘅方案：1 個 GitHub PAT token 就夠（gist scope）</div>
     </div>
   `);
 }
@@ -503,21 +508,22 @@ function visibleQuizzesCountForExport() {
 }
 
 /* ================================================
-   1e. Supabase 雲端同步 (optional)
-   - User 喺 Settings 輸入 Supabase URL + anon key
-   - 一個 user 一個 row (primary key = user_id)
-   - 每次 push 覆蓋自己個 row
+   1e. GitHub Gist 雲端同步 (optional, super simple)
+   - User 喺 Settings 輸入 1 個 GitHub Personal Access Token (gist scope)
+   - 自動 create private Gist "classview-state.json"
+   - 每次 sync = PATCH Gist
+   - 唔需要 database / SQL / server
    ================================================ */
 
-const CLOUD_CONFIG_KEY = 'classview_cloud_config_v1';
-const CLOUD_TABLE = 'classview_user_data'; // 預設
+const CLOUD_CONFIG_KEY = 'classview_github_config_v1';
+const GIST_FILENAME = 'classview-state.json';
 
 function getCloudConfig() {
   try {
     const raw = localStorage.getItem(CLOUD_CONFIG_KEY);
-    return raw ? JSON.parse(raw) : { url: '', anonKey: '', tableName: CLOUD_TABLE };
+    return raw ? JSON.parse(raw) : { pat: '', gistId: '' };
   } catch (e) {
-    return { url: '', anonKey: '', tableName: CLOUD_TABLE };
+    return { pat: '', gistId: '' };
   }
 }
 
@@ -527,62 +533,44 @@ function saveCloudConfig(cfg) {
 
 function isCloudConfigured() {
   const cfg = getCloudConfig();
-  return !!(cfg.url && cfg.anonKey);
+  return !!(cfg.pat);
 }
 
-function getSupabaseClient() {
-  if (!isCloudConfigured()) return null;
-  if (!window.supabase) return null;
-  const cfg = getCloudConfig();
-  return window.supabase.createClient(cfg.url, cfg.anonKey, {
-    auth: { persistSession: false },
+async function githubApi(path, method = 'GET', body = null, pat = null) {
+  const token = pat || getCloudConfig().pat;
+  if (!token) throw new Error('未設定 GitHub PAT');
+  const headers = {
+    'Authorization': `Bearer ${token}`,
+    'Accept': 'application/vnd.github+json',
+    'X-GitHub-Api-Version': '2022-11-28',
+  };
+  if (body) headers['Content-Type'] = 'application/json';
+  const r = await fetch(`https://api.github.com${path}`, {
+    method,
+    headers,
+    body: body ? JSON.stringify(body) : undefined,
   });
+  if (!r.ok) {
+    const text = await r.text();
+    throw new Error(`GitHub ${r.status}: ${text.slice(0, 200)}`);
+  }
+  return await r.json();
 }
 
 async function pushToCloud() {
   const u = currentUser();
   if (!u) { toast('請先登入', 'error'); return; }
   if (!isCloudConfigured()) {
-    openModal(`
-      <div class="modal-header">
-        <div class="modal-title">☁️ 設定雲端同步 (Supabase)</div>
-        <button class="modal-close" onclick="closeModal()">×</button>
-      </div>
-      <div class="form-group">
-        <div class="form-hint">需要先喺 Supabase 建立 project，拎 URL + anon key 填下面。</div>
-      </div>
-      <div class="form-group">
-        <label class="form-label">Supabase Project URL</label>
-        <input type="text" id="cloudUrl" class="form-input" placeholder="https://xxxxx.supabase.co" value="${escapeAttr(getCloudConfig().url)}">
-      </div>
-      <div class="form-group">
-        <label class="form-label">Supabase Anon Public Key</label>
-        <input type="password" id="cloudAnonKey" class="form-input" placeholder="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..." value="${escapeAttr(getCloudConfig().anonKey)}">
-        <div class="form-hint">anon key 係公開嘅（前端用），但用嚟過濾 RLS。見 SUPABASE_SETUP.md。</div>
-      </div>
-      <div class="form-group">
-        <label class="form-label">Table 名稱</label>
-        <input type="text" id="cloudTable" class="form-input" value="${escapeAttr(getCloudConfig().tableName || CLOUD_TABLE)}">
-        <div class="form-hint">預設 <code>classview_user_data</code>。要喺 Supabase 創建（SQL 見 SUPABASE_SETUP.md）。</div>
-      </div>
-      <div class="row-end">
-        <button class="btn btn-ghost" onclick="closeModal()">取消</button>
-        <button class="btn btn-primary" onclick="saveCloudSettings()">💾 儲存設定</button>
-      </div>
-    `);
+    openCloudSettings();
     return;
   }
-  const client = getSupabaseClient();
-  if (!client) {
-    toast('❌ Supabase client 載入失敗（檢查 CDN）', 'error');
-    return;
-  }
-  const cfg = getCloudConfig();
-  toast('上傳中…', 'success');
+  toast('上傳到 Gist 中…', 'success');
   try {
-    const payload = {
-      user_id: u.id,
-      username: u.username,
+    const cfg = getCloudConfig();
+    const content = JSON.stringify({
+      _schema: 'classview-plickers-v1',
+      _exportedAt: new Date().toISOString(),
+      _exportedBy: u.username,
       data: {
         users: state.users,
         currentUserId: state.currentUserId,
@@ -592,11 +580,30 @@ async function pushToCloud() {
         students: state.students,
         sessions: state.sessions,
       },
-      updated_at: new Date().toISOString(),
-    };
-    const { error } = await client.from(cfg.tableName).upsert(payload, { onConflict: 'user_id' });
-    if (error) throw error;
-    toast(`✓ 已上傳到雲端（${state.quizzes.length} 題 / ${state.students.length} 學生 / ${state.sessions.length} 答題）`, 'success');
+    }, null, 2);
+    let gistId = cfg.gistId;
+    if (!gistId) {
+      // 自動 create private Gist
+      const gist = await githubApi('/gists', 'POST', {
+        description: `ClassView 答題卡 雲端備份（${u.username}）`,
+        public: false,
+        files: {
+          [GIST_FILENAME]: { content },
+        },
+      }, cfg.pat);
+      gistId = gist.id;
+      saveCloudConfig({ pat: cfg.pat, gistId });
+      toast(`✓ 已建立 Gist: ${gist.html_url}`, 'success');
+    } else {
+      // Update existing Gist
+      await githubApi(`/gists/${gistId}`, 'PATCH', {
+        files: {
+          [GIST_FILENAME]: { content },
+        },
+      }, cfg.pat);
+    }
+    const counts = `${state.quizzes.length} 題 / ${state.students.length} 學生 / ${state.sessions.length} 答題`;
+    toast(`✓ 已上傳到雲端（${counts}）`, 'success');
   } catch (e) {
     console.error(e);
     toast('❌ 上傳失敗：' + e.message, 'error');
@@ -607,25 +614,26 @@ async function pullFromCloud() {
   const u = currentUser();
   if (!u) { toast('請先登入', 'error'); return; }
   if (!isCloudConfigured()) {
-    toast('❌ 雲端未設定，請先輸入 Supabase URL + Key', 'error');
+    toast('❌ 雲端未設定，請先設定 GitHub PAT', 'error');
+    return;
+  }
+  const cfg = getCloudConfig();
+  if (!cfg.gistId) {
+    toast('☁️ 雲端 Gist 仲未建立（先撳「⬆️ 上傳」建立 Gist）', 'warning');
     return;
   }
   if (!confirm(`⚠️ 從雲端下載會覆蓋現有資料！\n\n建議先匯出本地備份。\n\n確定繼續？`)) return;
-  const client = getSupabaseClient();
-  if (!client) { toast('❌ Supabase client 載入失敗', 'error'); return; }
-  const cfg = getCloudConfig();
-  toast('下載中…', 'success');
+  toast('從 Gist 下載中…', 'success');
   try {
-    const { data, error } = await client.from(cfg.tableName).select('*').eq('user_id', u.id).maybeSingle();
-    if (error) throw error;
-    if (!data) {
-      toast('☁️ 雲端冇你嘅記錄（首次上傳前）', 'warning');
-      return;
-    }
+    const gist = await githubApi(`/gists/${cfg.gistId}`);
+    const file = gist.files[GIST_FILENAME];
+    if (!file) throw new Error('Gist 入面搵唔到 ' + GIST_FILENAME);
+    const content = file.content;
+    const parsed = JSON.parse(content);
+    if (!parsed.data) throw new Error('Gist 內容格式錯誤（缺少 data）');
     // 確認 overwrite
-    if (!confirm(`📦 雲端記錄：\n用戶：${data.username}\n更新時間：${data.updated_at || '未知'}\n\n覆蓋本地資料？`)) return;
-    // Apply cloud data
-    const s = data.data || {};
+    if (!confirm(`📦 雲端記錄：\n用戶：${parsed._exportedBy || '未知'}\n備份時間：${parsed._exportedAt || '未知'}\n\n覆蓋本地資料？`)) return;
+    const s = parsed.data || {};
     ['users', 'folders', 'quizzes', 'classes', 'students', 'sessions'].forEach(k => {
       state[k].splice(0, state[k].length);
       (s[k] || []).forEach(x => state[k].push(x));
@@ -642,13 +650,59 @@ async function pullFromCloud() {
   }
 }
 
+function openCloudSettings() {
+  const cfg = getCloudConfig();
+  const isConfigured = !!cfg.pat;
+  openModal(`
+    <div class="modal-header">
+      <div class="modal-title">☁️ 設定雲端同步 (GitHub Gist)</div>
+      <button class="modal-close" onclick="closeModal()">×</button>
+    </div>
+    <div class="form-group">
+      <div class="form-hint">最簡單嘅方案：只係用你 GitHub account + 1 個 Personal Access Token。</div>
+    </div>
+    <div class="form-group">
+      <label class="form-label">🔑 GitHub Personal Access Token (PAT)</label>
+      <input type="password" id="cloudPat" class="form-input" placeholder="ghp_xxxxxxxxxxxxxxxxxxxx" value="${escapeAttr(cfg.pat)}">
+      <div class="form-hint">
+        ${isConfigured && cfg.gistId ? '✓ 已綁定 Gist: <code>' + escapeHtml(cfg.gistId) + '</code>' : '⚠️ 第一次上傳會自動建立 private Gist'}
+      </div>
+    </div>
+    <div class="form-group">
+      <div class="form-hint">
+        <b>📋 點拎 token（1 分鐘）：</b><br>
+        1. 去 <a href="https://github.com/settings/tokens/new" target="_blank">github.com/settings/tokens/new</a><br>
+        2. <b>Note</b>: <code>classview-sync</code><br>
+        3. <b>Expiration</b>: 90 days（或 No expiration）<br>
+        4. <b>Scopes</b>: 只剔 <b>☑ gist</b>（其他唔剔）<br>
+        5. 撳 <b>Generate token</b> → 即刻複製 token
+      </div>
+    </div>
+    <div class="form-group">
+      <div class="form-hint">
+        <b>🔒 安全提示：</b><br>
+        • Token 只會儲存喺你嘅瀏覽器 localStorage<br>
+        • 建議用 <b>gist only</b> scope（讀寫 Gist 專用）<br>
+        • 如果外洩，喺 <a href="https://github.com/settings/tokens" target="_blank">tokens 頁</a> 撳 <b>Revoke</b> 即可
+      </div>
+    </div>
+    <div class="row-end">
+      <button class="btn btn-ghost" onclick="closeModal()">取消</button>
+      <button class="btn btn-primary" onclick="saveCloudSettings()">💾 儲存設定</button>
+    </div>
+  `);
+}
+
+window.openCloudSettings = openCloudSettings;
+
 window.saveCloudSettings = function() {
-  const url = document.getElementById('cloudUrl')?.value?.trim();
-  const anonKey = document.getElementById('cloudAnonKey')?.value?.trim();
-  const tableName = document.getElementById('cloudTable')?.value?.trim() || CLOUD_TABLE;
-  if (!url) { toast('請輸入 Supabase URL', 'error'); return; }
-  if (!anonKey) { toast('請輸入 Supabase Anon Key', 'error'); return; }
-  saveCloudConfig({ url, anonKey, tableName });
+  const pat = document.getElementById('cloudPat')?.value?.trim();
+  if (!pat) { toast('請輸入 GitHub PAT', 'error'); return; }
+  if (!pat.startsWith('ghp_') && !pat.startsWith('github_pat_')) {
+    toast('⚠️ Token 格式好似唔啾（應該以 ghp_ 或 github_pat_ 開頭）', 'warning');
+  }
+  const cfg = getCloudConfig();
+  saveCloudConfig({ pat, gistId: cfg.gistId || '' });
   toast('✓ 已儲存雲端設定', 'success');
   closeModal();
 };
